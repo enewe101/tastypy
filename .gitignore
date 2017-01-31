@@ -1,0 +1,9 @@
+.DS_Store
+*.pyc
+*.swo
+*.swp
+~*
+*~
+docs/_build
+dist
+tastypy/test
