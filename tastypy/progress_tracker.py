@@ -9,14 +9,29 @@ crash or suspension.
 import tastypy
 
 
-class ProgressTracker(tastypy.PersistentOrderedDict):
-	"""
+Trackers = {}
+def ProgressTracker(path, *args, **kwargs):
+	path = tastypy.normalize_path(path)
+	try:
+		return Trackers[path]
+	except KeyError:
+		Trackers[path] = _ProgressTracker(path, *args, **kwargs)
+		return Trackers[path]
+
+Tracker = ProgressTracker
+
+
+# TODO: override setitem so that new top-level keys can't be added without an
+# explicit call to ``.add()``.
+class _ProgressTracker(tastypy.PersistentOrderedDict):
+	"""ProgressTracker(path)
+
 	A specialized subclass of POD whose values are all dictionaries
 	representing the status of tasks or items to be "done", with convenience
 	functions for keeping track of the number of times items have been tried.
 	Synchronizing disk using files stored under ``path``.  If ``gzipped`` is
 	``True``, then gzip the persistence files.  ``lines_per_file`` determines
-	how many of the ``Tracker``'s values are stored in a single before creating
+	how many of the ``Tracker``\ |s| values are stored in a single before creating
 	a new one.
 	"""
 
@@ -78,7 +93,7 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 		# number of keys that are done and number of keys that have been tried.
 		self._num_done = 0
 		self._num_tried = 0
-		super(ProgressTracker, self)._read()
+		super(_ProgressTracker, self)._read()
 
 
 	def _read_intercept(self, key, value):
@@ -102,7 +117,8 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 			self._num_tried -= 1
 
 		self[key]['_tries'] -= 1
-		self.update(key)
+		self.mark_dirty(key)
+		self.maybe_sync()
 
 
 	def increment_tries(self, key):
@@ -117,7 +133,8 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 			self._num_tried += 1
 
 		self[key]['_tries'] += 1
-		self.update(key)
+		self.mark_dirty(key)
+		self.maybe_sync()
 
 
 	def reset_tries(self, key):
@@ -132,7 +149,8 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 			self._num_tried -= 1
 
 		self[key]['_tries'] = 0
-		self.update(key)
+		self.mark_dirty(key)
+		self.maybe_sync()
 
 
 	def tries(self, key):
@@ -154,7 +172,8 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 		if not self[key]['_done']:
 			self._num_done += 1
 			self[key]['_done'] = True
-			self.update(key)
+			self.mark_dirty(key)
+			self.maybe_sync()
 
 
 	def mark_not_done(self, key):
@@ -168,7 +187,8 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 		if self[key]['_done']:
 			self._num_done -= 1
 			self[key]['_done'] = False
-			self.update(key)
+			self.mark_dirty(key)
+			self.maybe_sync()
 
 
 	def num_done(self):
@@ -237,3 +257,6 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 		formatter = '%.' + str(decimals) + 'f %%'
 		return formatter % (100 * fraction)
 
+
+# Make a shorter alias
+_Tracker = _ProgressTracker

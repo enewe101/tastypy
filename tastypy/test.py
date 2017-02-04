@@ -7,6 +7,11 @@ import shutil
 import tastypy
 import multiprocessing
 
+# TODO: test that key access can trigger sync'ing and that it the accessed key
+# remains dirty afterward
+# TODO: test that int and tuple-typed keys work
+
+
 def remove_if_exists(path):
 	if os.path.exists(path):
 		shutil.rmtree(path)
@@ -29,7 +34,7 @@ class TestPOD(TestCase):
 		# Test that data is stored correctly, and persisted after the POD
 		# object is deleted in this namespace
 		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy.POD(self.TEST_PATH)
+		my_pod = tastypy._POD(self.TEST_PATH)
 		my_pod.hold()
 		my_pod['a'] = 1
 		my_pod['b'] = '2'
@@ -38,18 +43,13 @@ class TestPOD(TestCase):
 			my_pod[str(i)] = i
 		my_pod.sync()
 
-		# Delete the POD.  Its data should persist though!
-		del my_pod
-
 		# Open a POD to same location, and check tha all data is there
-		my_pod = tastypy.POD(self.TEST_PATH)
-		self.assertEqual(my_pod['a'], 1)
-		self.assertEqual(my_pod['b'], '2')
-		self.assertEqual(my_pod['c'], {'key': [1, '2']})
-		vals = [my_pod[str(i)] for i in range(tastypy.DEFAULT_LINES_PER_FILE)]
+		other_pod = tastypy._POD(self.TEST_PATH)
+		self.assertEqual(other_pod['a'], 1)
+		self.assertEqual(other_pod['b'], '2')
+		self.assertEqual(other_pod['c'], {'key': [1, '2']})
+		vals = [other_pod[str(i)] for i in range(tastypy.DEFAULT_LINES_PER_FILE)]
 		self.assertEqual(vals, range(tastypy.DEFAULT_LINES_PER_FILE))
-
-		shutil.rmtree(self.TEST_PATH)
 
 
 	def test_integrity_check(self):
@@ -60,7 +60,7 @@ class TestPOD(TestCase):
 
 		# Make a POD
 		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy.POD(self.TEST_PATH)
+		my_pod = tastypy._POD(self.TEST_PATH)
 		my_pod.hold()
 		for i in range(2 * tastypy.DEFAULT_LINES_PER_FILE):
 			my_pod[str(i)] = 'yo'
@@ -74,11 +74,11 @@ class TestPOD(TestCase):
 
 		# Check that an integrity error gets raised.
 		with self.assertRaises(tastypy.PersistentOrderedDictIntegrityError):
-			my_pod = tastypy.POD(self.TEST_PATH)
+			my_pod.revert()
 
 		# Remove old POD's files and make a new POD
 		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy.POD(self.TEST_PATH)
+		my_pod = tastypy._POD(self.TEST_PATH)
 		my_pod.hold()
 		for i in range(2 * tastypy.DEFAULT_LINES_PER_FILE):
 			my_pod[str(i)] = i
@@ -91,7 +91,7 @@ class TestPOD(TestCase):
 
 		# Check that an integrity error gets raised
 		with self.assertRaises(tastypy.PersistentOrderedDictIntegrityError):
-			my_pod = tastypy.POD(self.TEST_PATH)
+			my_pod = tastypy._POD(self.TEST_PATH)
 
 
 	def test_synchronization_control(self):
@@ -104,42 +104,52 @@ class TestPOD(TestCase):
 		# Clear previous data files if any
 		remove_if_exists(self.TEST_PATH)
 
-		# By default, data is sync'd immediately
-		my_pod = tastypy.POD(self.TEST_PATH)
+		# By default, data is not sync'd immediately
+		my_pod = tastypy._POD(self.TEST_PATH)
 		my_pod['a'] = 1
 
-		del my_pod
-		my_pod = tastypy.POD(self.TEST_PATH)
-		self.assertEqual(my_pod['a'], 1)
+		other_pod = tastypy._POD(self.TEST_PATH)
+		with self.assertRaises(KeyError):
+			self.assertEqual(other_pod['a'], 1)
+
+		# Data is synced when the buffer reaches a certain size
+		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+			my_pod[str(i)] = i
+		other_pod = tastypy._POD(self.TEST_PATH)
+		self.assertEqual(other_pod['a'], 1)
 
 		# When a hold is applied, data is no longer sync'd
 		my_pod.hold()
 		my_pod['b'] = 2
-		
-		# Accessing my_pod['b'] will raise a key error
-		my_other_pod = tastypy.POD(self.TEST_PATH)
+		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+			my_pod[str(i)] = i
+		my_other_pod = tastypy._POD(self.TEST_PATH)
 		with self.assertRaises(KeyError):
 			my_other_pod['b']
 
 		# Calling sync() does synchronize out-of-sync data
 		my_pod.sync()
-		my_other_pod = tastypy.POD(self.TEST_PATH)
+		my_other_pod = tastypy._POD(self.TEST_PATH)
 		self.assertTrue(my_other_pod['b'], 2)
 
 		# But automatic synchronization is still disabled
 		my_pod['c'] = 3
-		my_other_pod = tastypy.POD(self.TEST_PATH)
+		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+			my_pod[str(i)] = i
+		my_other_pod = tastypy._POD(self.TEST_PATH)
 		with self.assertRaises(KeyError):
 			my_other_pod['c']
 
 		# Calling unhold() also synchronizes out-of-sync data
 		my_pod.unhold()
-		my_other_pod = tastypy.POD(self.TEST_PATH)
+		my_other_pod = tastypy._POD(self.TEST_PATH)
 		self.assertEqual(my_other_pod['c'], 3)
 
 		# And it also re-enables automatic synchronization
 		my_pod['d'] = 4
-		my_other_pod = tastypy.POD(self.TEST_PATH)
+		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+			my_pod[str(i)] = i
+		my_other_pod = tastypy._POD(self.TEST_PATH)
 		self.assertEqual(my_other_pod['d'], 4)
 
 
@@ -154,7 +164,7 @@ class TestPOD(TestCase):
 		remove_if_exists(self.TEST_PATH)
 
 		# Test various iteration functions
-		my_pod = tastypy.POD(self.TEST_PATH)
+		my_pod = tastypy._POD(self.TEST_PATH)
 		my_pod.hold()
 		for i in range(num_lines):
 			my_pod[str(i)] = i
@@ -204,7 +214,7 @@ class TestPOD(TestCase):
 		remove_if_exists(self.TEST_PATH)
 
 		# Test that my_pod knows what keys it has
-		my_pod = tastypy.POD(self.TEST_PATH)
+		my_pod = tastypy._POD(self.TEST_PATH)
 		my_pod['a'] = 1
 		self.assertTrue('a' in my_pod)
 		self.assertFalse('b' in my_pod)
@@ -221,16 +231,17 @@ class TestTracker(TestCase):
 
 	def test_add(self):
 		remove_if_exists(self.TEST_PATH)
-		my_tracker = tastypy.Tracker(self.TEST_PATH)
+		my_tracker = tastypy._Tracker(self.TEST_PATH)
 
 		# Check that addition insets the expected value
 		my_tracker.add('a')
+		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+			my_tracker.add(str(i))
 		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':False})
 
 		# Verify persistence
-		del my_tracker
-		my_tracker = tastypy.Tracker(self.TEST_PATH)
-		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':False})
+		new_tracker = tastypy._Tracker(self.TEST_PATH)
+		self.assertEqual(new_tracker['a'], {'_tries':0, '_done':False})
 
 		# Verify that DuplicateKeyError is raised if we try adding the same
 		# key twice
@@ -240,7 +251,7 @@ class TestTracker(TestCase):
 		# DuplicateKeyError is not raise for ``add_if_absent()``
 		my_tracker.add_if_absent('a')
 
-		# Test check (should return false)
+		# Test the check function (should return false)
 		self.assertFalse(my_tracker.check('a'))
 
 		# Mark done, now check should return True
@@ -283,9 +294,22 @@ class TestTracker(TestCase):
 		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':True})
 		self.assertEqual(my_tracker.tries('a'), 0)
 
-		# Test setting other values
-		my_tracker.set('a', 'b', 'c')
+		# Test setting a sub-key
+		my_tracker['a']['b'] = 'c'
 		self.assertEqual(my_tracker['a'], {'b':'c', '_tries':0, '_done':True})
+
+		# Test that a sub-key will be synchronized
+		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+			my_tracker.reset_tries(str(i))
+		other_tracker = tastypy._Tracker(self.TEST_PATH)
+		self.assertEqual(other_tracker['a'], {'b':'c', '_tries':0, '_done':True})
+
+	def test_done_tried(self):
+
+		# Test tries status
+		my_tracker = tastypy._Tracker(self.TEST_PATH)
+		my_tracker.add('a')
+		my_tracker.add('b')
 
 		# Test tries status
 		self.assertEqual(my_tracker.num_tried(), 0)
@@ -297,7 +321,7 @@ class TestTracker(TestCase):
 		my_tracker.increment_tries('a')
 		self.assertEqual(my_tracker.num_tried(), 2)
 		my_tracker.sync()
-		new_tracker = tastypy.Tracker(self.TEST_PATH)
+		new_tracker = tastypy._Tracker(self.TEST_PATH)
 		self.assertEqual(new_tracker.num_tried(), 2)
 		self.assertEqual(new_tracker.fraction_tried(), 1.0)
 		self.assertEqual(new_tracker.percent_tried(), '100.00 %')
@@ -306,6 +330,10 @@ class TestTracker(TestCase):
 		self.assertEqual(new_tracker.percent_tried(), '50.00 %')
 
 		# Test progress status
+		self.assertEqual(new_tracker.num_done(), 0)
+		self.assertEqual(new_tracker.fraction_done(), 0.0)
+		self.assertEqual(new_tracker.percent_done(), '0.00 %')
+		new_tracker.mark_done('a')
 		self.assertEqual(new_tracker.num_done(), 1)
 		self.assertEqual(new_tracker.fraction_done(), 0.5)
 		self.assertEqual(new_tracker.percent_done(), '50.00 %')
@@ -326,7 +354,6 @@ class TestSharedPOD(TestCase):
 	# TODO: test that in-memory values are still shared between processes when
 	# hold is active, but that all processes except caller are blocked when
 	# lock is called.
-
 	def test_basic_functions(self):
 		remove_if_exists(self.TEST_PATH)
 		my_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
@@ -364,16 +391,21 @@ class TestSharedPOD(TestCase):
 		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
 		self.assertTrue('d' in other_pod)
 
-		my_pod.hold()
-		my_pod.set('c', 'key', 2)
-		other_pod.close()
-		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		self.assertEqual(other_pod['c']['key'], 1)
+
+	def test_deep_assignment(self):
+
+		remove_if_exists(self.TEST_PATH)
+		my_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
+		my_pod['a'] = {'key': 1}
 		my_pod.sync()
-		other_pod.close()
 		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		self.assertEqual(other_pod['c']['key'], 2)
-		my_pod.unhold()
+		self.assertEqual(other_pod['a']['key'], 1)
+
+		my_pod['a', 'key'] = 2
+		my_pod.sync()
+		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
+		self.assertEqual(other_pod['a']['key'], 2)
+		self.assertEqual(other_pod['a', 'key'], 2)
 
 		my_pod.close()
 		other_pod.close()
@@ -497,54 +529,62 @@ class TestSharedTracker(TestCase):
 	def test_basic_function(self):
 		remove_if_exists(self.TEST_PATH)
 		my_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+
+		# Demonstrate basic persistence
 		my_tracker.add('a')
 		my_tracker.close()
-
 		my_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
 		self.assertTrue('a' in my_tracker)
 		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':False})
 		self.assertFalse('b' in my_tracker)
 
+		# Demonstrate hold()
 		my_tracker.hold()
-		my_tracker.set('a', 'key', 1)
+		my_tracker.maybe_sync()	# It should not sync because hold() was called
+		my_tracker['a', 'key'] = 1
 		other_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
 		self.assertTrue('a' in my_tracker)
 		self.assertTrue('a' in other_tracker)
 		self.assertRaises(KeyError, lambda: other_tracker['a']['key'])
 
+		# Unhold causes unsync'd values to be sync'd
 		my_tracker.unhold()
-		other_tracker.close()
-		other_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		other_tracker.revert()
 		self.assertTrue('a' in other_tracker)
 		self.assertEqual(other_tracker['a']['key'], 1)
 
-		other_tracker.close()
+		# Demonstrate increment_tries()
 		my_tracker.increment_tries('a')
-		other_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		my_tracker.sync()
+		other_tracker.revert()
 		self.assertEqual(other_tracker.tries('a'), 1)
 
-		other_tracker.close()
+		# Demonstrate decrement_tries()
 		my_tracker.decrement_tries('a')
-		other_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		my_tracker.sync()
+		other_tracker.revert()
 		self.assertEqual(other_tracker.tries('a'), 0)
 
-		other_tracker.close()
+		# Demontstrate mark_done() and check()
 		my_tracker.mark_done('a')
-		other_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		my_tracker.sync()
+		other_tracker.revert()
 		self.assertTrue(other_tracker.check('a'))
 
-		other_tracker.close()
+		# Demonstrate mark_not_done() and check()
 		my_tracker.mark_not_done('a')
-		other_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		my_tracker.sync()
+		other_tracker.revert()
 		self.assertFalse(other_tracker.check('a'))
 
-		other_tracker.close()
+		# Demonstrate num_done and num_tried, and related functions
 		my_tracker.add('b')
 		my_tracker.mark_done('b')
 		my_tracker.increment_tries('b')
 		my_tracker.add('c')
 		my_tracker.increment_tries('c')
-		other_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		my_tracker.sync()
+		other_tracker.revert()
 
 		self.assertEqual(other_tracker.num_done(), 1)
 		self.assertEqual(other_tracker.fraction_done(), 1/3.)
@@ -655,7 +695,7 @@ class TestSharedTracker(TestCase):
 			time.sleep(random.random() / 100.0)
 			key = '%s:%d' % (name, i)
 			tracker.add(key)
-			tracker.set(key, 'time', time.time())
+			tracker[key, 'time'] = time.time()
 		tracker.unholdlock()
 
 

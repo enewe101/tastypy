@@ -5,8 +5,13 @@ import subprocess
 import os
 
 
+def normalize_path(path):
+	return os.path.abspath(os.path.expanduser(path))
+
+
 def file_empty(file_path):
 	return os.stat(file_path).st_size == 0
+
 
 def ensure_removed(path):
 	"""
@@ -14,6 +19,7 @@ def ensure_removed(path):
 	"""
 	if os.path.exists(path):
 		shutil.rmtree(path)	
+
 
 def ensure_exists(path):
 	"""

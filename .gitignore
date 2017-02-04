@@ -6,4 +6,6 @@
 *~
 docs/_build
 dist
-tastypy/test
+tastypy/test.pod
+tastypy/test.tracker
+

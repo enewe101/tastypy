@@ -32,7 +32,6 @@ def _requires_lock(lock):
 	return decorator
 
 
-
 def _requires_tracker_open(f):
 	def f_that_requires_tracker_open(self, *args, **kwargs):
 		if not self.tracker_open:
@@ -42,17 +41,6 @@ def _requires_tracker_open(f):
 	return f_that_requires_tracker_open
 
 	
-class ExceptionWrapper(object):
-
-    def __init__(self, ee):
-        self.ee = ee
-        __,  __, self.tb = sys.exc_info()
-
-    def re_raise(self):
-        raise self.ee, None, self.tb
-        # for Python > 2 replace the previous line by:
-        #raise self.ee.with_traceback(self.tb)
-
 
 def serve_datastructure(datastructure_builder, pipe):
 	"""
@@ -77,6 +65,7 @@ def serve_datastructure(datastructure_builder, pipe):
 		# Handle signal to shut down the progress tracker server
 		if message == SharedProgressTracker.CLOSE:
 			is_open = False
+			datastructure.sync()
 
 		# Handle remote function calls on the progress tracker
 		else:
@@ -110,7 +99,6 @@ def serve_datastructure(datastructure_builder, pipe):
 				try:
 					return_val = getattr(datastructure, attr)(*args)
 				except Exception as error:
-					#error = ExceptionWrapper(error)
 					pipe.send((None, error))
 				else:
 					pipe.send((return_val, None))
@@ -146,7 +134,7 @@ class SharedPersistentOrderedDict(object):
 	@_requires_lock(LOCK)
 	def close(self):
 		self.client_pipe.send(self.CLOSE)
-		#self.server_tracker.join()
+
 
 	@_requires_tracker_open
 	def lock(self):
@@ -156,12 +144,14 @@ class SharedPersistentOrderedDict(object):
 		"""
 		self.LOCK.acquire()
 
+
 	@_requires_tracker_open
 	def unlock(self):
 		"""
 		Allow read / write other processes.
 		"""
 		self.LOCK.release()
+
 
 	@_requires_tracker_open
 	def holdlock(self):
@@ -171,7 +161,11 @@ class SharedPersistentOrderedDict(object):
 		"""
 		self.LOCK.acquire()
 		self.client_pipe.send(('hold',))
-		return self.client_pipe.recv()
+		return_val, error = self.client_pipe.recv()
+		if error is not None:
+			raise error
+		return return_val
+
 
 	@_requires_tracker_open
 	def unholdlock(self):
@@ -181,10 +175,13 @@ class SharedPersistentOrderedDict(object):
 		to read / write
 		"""
 		self.client_pipe.send(('unhold',))
-		return_val = self.client_pipe.recv()
+		return_val, error = self.client_pipe.recv()
+		if error is not None:
+			raise error
 		self.LOCK.release()
 		return return_val
 
+	
 	@_requires_tracker_open
 	@_requires_lock(LOCK)
 	def hold(self):
@@ -194,7 +191,10 @@ class SharedPersistentOrderedDict(object):
 		other processes.
 		"""
 		self.client_pipe.send(('hold',))
-		return self.client_pipe.recv()
+		return_val, error = self.client_pipe.recv()
+		if error is not None:
+			raise error
+		return return_val
 
 	@_requires_tracker_open
 	@_requires_lock(LOCK)
@@ -205,7 +205,19 @@ class SharedPersistentOrderedDict(object):
 		other processes.
 		"""
 		self.client_pipe.send(('unhold',))
-		return_val = self.client_pipe.recv()
+		return_val, error = self.client_pipe.recv()
+		if error is not None:
+			raise error
+		return return_val
+
+	@_requires_tracker_open
+	@_requires_lock(LOCK)
+	def revert(self):
+		"""Proxy for ``POD.revert()``."""
+		self.client_pipe.send(('revert',))
+		return_val, error = self.client_pipe.recv()
+		if error is not None:
+			raise error
 		return return_val
 
 	@_requires_tracker_open
@@ -369,13 +381,16 @@ class SharedPersistentOrderedDict(object):
 
 	@_requires_tracker_open
 	@_requires_lock(LOCK)
-	def set(self, key, subkey, val):
+	def set(self, key_tuple, val):
 		"""Proxy for ``POD.set()``."""
-		self.client_pipe.send(('set', key, subkey, val))
+		self.client_pipe.send(('set', key_tuple, val))
 		return_val, error = self.client_pipe.recv()
 		if error is not None:
 			raise error
 		return return_val
+
+
+SharedPOD = SharedPersistentOrderedDict
 
 
 class SharedProgressTracker(SharedPersistentOrderedDict):
@@ -588,3 +603,5 @@ class SharedProgressTracker(SharedPersistentOrderedDict):
 			raise error
 		return return_val
 
+
+SharedTracker = SharedProgressTracker

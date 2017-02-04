@@ -14,20 +14,111 @@ import os
 import re
 import copy
 import gzip
+import signal
+import sys
 
 
-DEFAULT_LINES_PER_FILE = 1000
+DEFAULT_FILE_SIZE = 1000
+DEFAULT_SYNC_AT = 1000
+
+def tuplify_lists(obj):
+	if isinstance(obj, list):
+		for i, element in enumerate(obj):
+			obj[i] = tuplify_lists(element)
+		obj = tuple(obj)
+	return obj
+
+
+def _deep_setitem(container, key_tuple, value):
+	owner = _deep_getitem(container, key_tuple[:-1])
+	owner[key_tuple[-1]] = value
+
+
+def _deep_getitem(container, key_tuple):
+	value = container
+	for key in key_tuple:
+		value = value[key]
+	return value
+
+
+class DeepKey(object):
+
+	def __init__(
+		self, 
+		callback=None,
+		parent_deepkey=None,
+		parent_key=None
+	):
+		self.callback = callback
+		self.parent_deepkey = parent_deepkey
+		self.parent_key = parent_key
+
+		validates_as_root_key = (
+			callback is not None and parent_key is None
+		)
+		validates_as_deep_key = (
+			callback is None and parent_key is not None
+		)
+		if validates_as_root_key:
+			self.placement = 'root'
+		elif validates_as_deep_key:
+			self.placement = 'deep'
+		else:
+			raise ValueError(
+				'Either provide callback or provide both parent_deepkey '
+				'and parent_key'
+			)
+
+	def __getitem__(self, key):
+		return DeepKey(parent_deepkey=self, parent_key=key)
+
+	def __setitem__(self, key, val):
+		if self.placement == 'deep':
+			self.parent_deepkey.setitem((self.parent_key, key,), val)
+
+		else:
+			self.callback((key,), val)
+
+	def setitem(self, keys, val):
+		if self.placement == 'deep':
+			self.parent_deepkey.setitem((self.parent_key,) + keys, val)
+		else:
+			self.callback(keys, val)
+
+
+
+class Mutator(object):
+	def __init__(self, client):
+		self.client = client
+
+	def __getitem__(self, key):
+		val = self.client[key]
+		self.client.update(key)
+		return val
+
+
+class SingletonDecorator:
+    def __init__(self,klass):
+        self.klass = klass
+        self.instance = None
+    def __call__(self,*args,**kwds):
+        if self.instance == None:
+            self.instance = self.klass(*args,**kwds)
+        return self.instance
+
 
 
 class PersistentOrderedDict(object):
 	""" 
-	Create (or re-establish) a ``PersistentOrderedDict``, synchronizing to disk
-	using files stored under ``path``.  If ``gzipped`` is ``True``, then gzip
-	the persistence files.  ``lines_per_file`` determines how many of the
-	``POD``'s values are stored in a single before creating a new one.  A large
-	number reduces the total number of files crated, whereas a smaller number
-	makes for faster synchronization because a smaller amount of data needs to
-	be written to update a single change.
+	A key-value mapping container that synchronizes transparently to disk at
+	the location given by ``path``.  Data will persist after program
+	interruption and can be accessed by creating a new instance directed at the
+	same path.  The JSON-formatted persistence files are gzipped if ``gzipped`` 
+	is ``True``.  Each files stores a number of values given by
+	``file_size``.  Smaller values give faster synchronization but create 
+	more files.  Synchronization automatically occurs when the number of
+	values that are out of sync with those stored on disk reaches ``sync_at``
+	or if the program terminates.
 	"""
 
 	_ESCAPE_TAB_PATTERN = re.compile('\t')
@@ -35,33 +126,195 @@ class PersistentOrderedDict(object):
 	_ESCAPE_SLASH_PATTERN = re.compile(r'\\')
 	_UNESCAPE_SLASH_PATTERN = re.compile(r'\\\\')
 
+	_SHARED_STATE = {}
+
 	def __init__(
 		self, 
 		path,
 		gzipped=False,
-		lines_per_file=DEFAULT_LINES_PER_FILE,
-		verbose=False
+		file_size=DEFAULT_FILE_SIZE,
+		sync_at=DEFAULT_SYNC_AT
 	):
 
+		path = tastypy.normalize_path(path)
+		if path not in self._SHARED_STATE:
+			self._SHARED_STATE[path] = {}
+		self.__dict__ = self._SHARED_STATE[path]
+
 		self.path = path
-		self.lines_per_file = lines_per_file
+		self.file_size = file_size
 		self.gzipped = gzipped
-		self.verbose = verbose
+		self.sync_at = sync_at
 
 		self._set_write_method(gzipped)
+
+		# Make the path in which files will be written.  If there's going to be
+		# a problem with writing, it should arise now
 		self._ensure_path(path)
+
+		# Load values from disk into memory.
+		self.revert()
+
+		# Hold is off by default, meaning that the record on disk is sync'ed
+		# automatically
+		self._hold = False
+
+		# Always be sure to synchronize before the script exits
+		atexit.register(self.sync)
+		signal.signal(signal.SIGTERM, self._sync_on_terminate)
+
+
+	def _sync_on_terminate(self, sig_num, frame):
+		# Wraps sync() so that it can be registered as a SIGTERM handler
+		self.sync()
+		sys.exit(0)
+
+
+	def keys(self):
+		"""
+		Return a list of the keys, matching the order in which they were added.
+		"""
+		return [key for key in self._keys]
+
+
+	def values(self):
+		"""
+		Return a list of the ``POD``'s values.  The order of values is
+		guaranteed to match the order of ``self.keys()``
+		"""
+		return [self.__getitem__(key) for key in self._keys]
+
+
+
+	def items(self):
+		"""
+		Return a list of key-value pairs, matching the order in which keys were 
+		added.
+		"""
+		return [(key, self.__getitem__(key)) for key in self._keys]
+
+
+	def iteritems(self):
+		"""
+		Return an iterator that yields key-value pairs, matching the order
+		in which keys were added.
+		"""
+		for key in self._keys:
+			yield key, self.__getitem__(key)
+
+
+	def mark_dirty(self, key):
+		"""
+		Force ``key`` to be considered out of sync.  The data associated to
+		this key will be re-written to file during the next synchronization.
+		"""
+		key = self._ensure_unicode(key)
+		self._dirty.add(key)
+
+
+	def update(self, key):
+		'''
+		Force ``key`` to be synchronized to disk immediately.
+		'''
+		key = self._ensure_unicode(key)
+		self.mark_dirty(key)
+		self.sync()
+
+
+	def set(self, key_tuple, value):
+		main_key = self._ensure_unicode(key_tuple[0])
+		key_tuple = (main_key,) + key_tuple[1:]
+		_deep_setitem(self, key_tuple, value)
+		self.mark_dirty(key_tuple[0])
+		self._maybe_sync()
+
+
+	def sync(self):
+		"""
+		Force synchronization of all "dirty" values (which have changed from
+		the values stored on disk).
+		"""
+		dirty_files = set()
+		for key in self._dirty:
+			index = self.index_lookup[key]
+			file_num = index / self.file_size
+			dirty_files.add(file_num)
+
+		# The write directory should exist, but ensure it.
+		self._ensure_path(self.path)
+
+		# Rewrite all the dirty files
+		for file_num in dirty_files:
+
+			# Get the dirty file
+			path =  self._path_from_int(file_num)
+			f = self.open(path, 'w')
+
+			# Go through keys mapped to this file and re-write them
+			start = file_num * self.file_size
+			stop = start + self.file_size
+			for key in self._keys[start:stop]:
+
+				value = self._values[key]
+				# Escape tabs in key, and encode using utf8
+				serialized_key = self._serialize_key(key)
+				serialized_value = self._serialize_value(value)
+				f.write('%s\t%s\n' % (serialized_key, serialized_value))
+
+		# No more dirty keys
+		self._dirty = set()
+
+
+	def hold(self):
+		"""
+		Suspend automatic synchronization to disk.
+		"""
+		self._hold = True
+
+	
+	def unhold(self):
+		"""
+		Resume automatic synchronization to disk.
+		"""
+		self._hold = False
+		self.maybe_sync()
+
+
+	def revert(self):
+		"""
+		Load values from disk into memory, discarding any unsynchronized changes.
+		Forget any files have been marked "dirty".
+		"""
 
 		# read in all data (if any)
 		self._read()
 
-		# Hold is off by default -> updates are immediately written to file
-		self._hold = False
-
 		# Keep track of files whose contents don't match values in memory
-		self._dirty_files = set()
+		self._dirty = set()
 
-		# Always be sure to synchronize before the script exits
-		atexit.register(self.unhold)
+
+	def copy(self, path, file_size, gzipped=False):
+		"""
+		Synchronize the POD to a new location on disk specified by ``path``.  
+		Future synchronization will also take place at this new location.  
+		The old location on disk will be left as-is and will no longer be 
+		synchronized.  When synchronizing store ``file_size`` number of
+		values per file, and keep files gzipped if ``gzipped`` is ``True``.
+		This is not affected by ``hold()``.
+		"""
+
+		self.gzipped = gzipped
+		self.path = path
+		self.file_size = file_size
+
+		self._set_write_method(gzipped)
+		self._ensure_path(path)
+
+		num_files = int(math.ceil(
+			len(self._values) / float(self.file_size)
+		))
+		self._dirty_files = set(range(num_files))
+		self.sync()
 
 
 	def _set_write_method(self, gzipped):
@@ -86,45 +339,6 @@ class PersistentOrderedDict(object):
 			)
 
 
-	def copy(self, path, lines_per_file, gzipped=False):
-		"""
-		Synchronize the POD to a new location on disk specified by ``path``.  
-		Future synchronization will also take place at this new location.  
-		The old location on disk will be left as-is and will no longer be 
-		synchronized.  When synchronizing store ``lines_per_file`` number of
-		values per file, and keep files gzipped if ``gzipped`` is ``True``.
-		This is not affected by ``hold()``.
-		"""
-
-		self.gzipped = gzipped
-		self.path = path
-		self.lines_per_file = lines_per_file
-
-		self._set_write_method(gzipped)
-		self._ensure_path(path)
-
-		num_files = int(math.ceil(
-			len(self._values) / float(self.lines_per_file)
-		))
-		self._dirty_files = set(range(num_files))
-		self.sync()
-
-
-	def hold(self):
-		"""
-		Suspend automatic synchronization to disk.
-		"""
-		self._hold = True
-
-	
-	def unhold(self):
-		"""
-		Resume automatic synchronization to disk, and synchronize immediately.
-		"""
-		self._hold = False
-		self.sync()
-
-
 	def _path_from_int(self, i):
 		# Get the ith synchronization file's full path.
 		if self.gzipped:
@@ -139,10 +353,9 @@ class PersistentOrderedDict(object):
 		self.index_lookup = {}
 		self._values = {}
 
-		for i, fname in enumerate(tastypy.ls(self.path, dirs=False)):
-
-			if self.verbose:
-				print fname
+		for i, fname in enumerate(
+			tastypy.ls(self.path, dirs=False, absolute=True
+		)):
 
 			# ensure that files are in expected order,
 			# that none are missing, and that no lines are missing.
@@ -157,7 +370,7 @@ class PersistentOrderedDict(object):
 				num_lines_prev_file = len(
 					self.open(prev_file_path, 'r').readlines()
 				)
-				if num_lines_prev_file != self.lines_per_file:
+				if num_lines_prev_file != self.file_size:
 					raise tastypy.PersistentOrderedDictIntegrityError(
 						"PersistentOrderedDict: "
 						"A file on disk appears to be corrupted, because "
@@ -170,13 +383,12 @@ class PersistentOrderedDict(object):
 				if entry=='':
 					continue
 
-				# remove the newline of the end of json_record, and read it
+				# remove the newline of the end of serialized_value, and read it
 				try:
-					key, json_record = entry.split('\t', 1)
-					key = self._UNESCAPE_TAB_PATTERN.sub('\g<prefix>\t', key)
-					key = self._UNESCAPE_SLASH_PATTERN.sub(r'\\', key)
-					key = key.decode('utf8')
-					value = json.loads(json_record[:-1])
+					serialized_key, serialized_value = entry.split('\t', 1)
+					key = self._deserialize_key(serialized_key)
+					value = self._deserialize_value(serialized_value[:-1])
+
 				except ValueError:
 					raise tastypy.PersistentOrderedDictIntegrityError(
 						'PersistentOrderedDict: A file on disk appears to be '
@@ -186,7 +398,7 @@ class PersistentOrderedDict(object):
 					)
 
 				# This is a hook for subclasses to intercept and re-interpret
-				# loaded data without re-implementing ``_read()``.
+				# loaded data without fully re-implementing ``_read()``.
 				key, value = self._read_intercept(key, value)
 
 				self._values[key] = value
@@ -194,68 +406,60 @@ class PersistentOrderedDict(object):
 				self.index_lookup[key] = len(self._keys)-1
 
 
+	def _serialize_key(self, key, recursed=False):
+
+		# Recursively ensure that strings are encoded
+		if isinstance(key, tuple):
+			temp_key = []
+			for item in key:
+				temp_key.append(self._serialize_key(item, recursed=True))
+			key = tuple(temp_key)
+
+		# Base call for recursion
+		elif isinstance(key, basestring):
+			key = key.encode('utf8')
+
+		# Do the actual serialization in the root call
+		if not recursed:
+			key = json.dumps(key)
+			key = self._ESCAPE_SLASH_PATTERN.sub(r'\\\\', key)
+			key = self._ESCAPE_TAB_PATTERN.sub(r'\\t', key)
+
+		return key
+
+
+	def _deserialize_key(self, serialized_key):
+		key = self._UNESCAPE_TAB_PATTERN.sub('\g<prefix>\t', serialized_key)
+		key = self._UNESCAPE_SLASH_PATTERN.sub(r'\\', key)
+		key = json.loads(key)
+		key = tuplify_lists(key)
+		return key
+
+
+	def _serialize_value(self, value):
+		return json.dumps(value)
+
+
+	def _deserialize_value(self, serialized_value):
+		return json.loads(serialized_value)
+
+
 	def _read_intercept(self, key, val):
 		return key, val
 
 
-	def mark_dirty(self, key):
-		"""
-		Force a specific ``key`` in the persistent ordered dict to be
-		considered out of sync, but do not synchronize it immediately.  The data 
-		associated to this key will be re-written to file during the next
-		synchronization.
-		"""
-
-		key = self._ensure_unicode(key)
-		index = self.index_lookup[key]
-		file_num = index / self.lines_per_file
-		self._dirty_files.add(file_num)
+	#def __del__(self):
+	#	self.sync()
 
 
-	def maybe_sync(self):
-		"""
-		Synchronize all values that have changed if the ``POD`` is not currently
-		on ``hold()``.
-		"""
-		if not self._hold:
-			self.sync()
+	def _maybe_sync(self, preemptive=0):
+		"""Synchronize if not currently on ``hold()``."""
+		if self._hold:
+			return
+		if len(self._dirty) < self.sync_at - preemptive:
+			return
+		self.sync()
 
-
-	def sync(self):
-		"""
-		Force synchronization of all values that have changed from those stored
-		on disk.
-		"""
-
-		for file_num in self._dirty_files:
-
-			# Get the dirty file
-			try:
-				path =  self._path_from_int(file_num)
-			except TypeError:
-				print file_num
-				raise
-			f = self.open(path, 'w')
-
-			# Go through keys mapped to this file and re-write them
-			start = file_num * self.lines_per_file
-			stop = start + self.lines_per_file
-			for key in self._keys[start:stop]:
-
-				record = self._values[key]
-				# Escape tabs in key, and encode using utf8
-				key = self._escape_key(key)
-				f.write('%s\t%s\n' % (key, json.dumps(record)))
-
-		# No more dirty files
-		self._dirty_files = set()
-
-
-	def _escape_key(self, key):
-		key = key.encode('utf8')
-		key = self._ESCAPE_SLASH_PATTERN.sub(r'\\\\', key)
-		key = self._ESCAPE_TAB_PATTERN.sub(r'\\t', key)
-		return key
 
 
 	def __iter__(self):
@@ -274,39 +478,6 @@ class PersistentOrderedDict(object):
 		return key
 
 
-	def items(self):
-		"""
-		Returns a list of key-value pairs matching the order in which keys were 
-		added.
-		"""
-		return [(key, self.__getitem__(key)) for key in self._keys]
-
-
-	def iteritems(self):
-		"""
-		Returns an iterator that yields key-value pairs, matching the order
-		in which keys were added.
-		"""
-		for key in self._keys:
-			yield key, self.__getitem__(key)
-
-	def keys(self):
-		"""
-		Returns a list of the ``POD``'s keys.  The order matches the order
-		in which keys were originally added, and matches the order of all
-		iterables / iterators provided.
-		"""
-		return [key for key in self._keys]
-
-
-	def values(self):
-		"""
-		Returns a list of the ``POD``'s values.  The order of values is
-		guaranteed to match the order of ``self.keys()``
-		"""
-		return [self.__getitem__(key) for key in self._keys]
-
-
 	def __contains__(self, key):
 		key = self._ensure_unicode(key)
 		return key in self.index_lookup
@@ -317,68 +488,64 @@ class PersistentOrderedDict(object):
 
 
 	def __getitem__(self, key):
+
+		# Ensure main key is unicode
 		key = self._ensure_unicode(key)
+
+		# If we accessed a key that exists, it may be about to be mutated
+		# So, we'll cautiously mark it as dirty, and possibly trigger a
+		# synchronization.  However, there is a gotcha: assignment would happen
+		# after this function returns, so, if synchronization is triggered, we
+		# within this function, we actually still want this key to be dirty.
+		# Therefore we trigger synchronization preemptively and mark the key
+		# dirty after.
+		if self.__contains__(key):
+			self._maybe_sync(preemptive=True)
+			self.mark_dirty(key)
+
 		return self._values[key]
 
 
 	def _ensure_unicode(self, key):
 		# Forces str-like keys to be unicode
-		# ensure that the key is string-like
-		if not isinstance(key, basestring):
+
+		# ensure that the key is a valid type
+		if not isinstance(key, (basestring, tuple, int)):
 			raise ValueError(
-				'Keys must be str or unicode, and will be converted to '
-				'unicode type internally.'
+				'Keys must be strings, integers, or (arbitrarily nested) '
+				'tuples of them.'
 			)
 
-		# cast the key into unicode if necessary
-		if not isinstance(key, unicode):
+		# Recurse if necessary
+		if isinstance(key, tuple):
+			temp_key = []
+			for item in key:
+				temp_key.append(self._ensure_unicode(item))
+			key = tuple(temp_key)
+
+		# Ensure that strings are unicode
+		elif isinstance(key, basestring) and not isinstance(key, unicode):
 			key = key.decode('utf8')
 
 		return key
 
 
-	def update(self, key):
-		'''
-		Forces a ``key`` to be synchronized to disk.  If ``hold()`` has been 
-		called to suspend synchronization, then ``key`` will be marked for
-		synchronization but will not be sync'd immediately.
-		'''
-		key = self._ensure_unicode(key)
-		self.mark_dirty(key)
-		self.maybe_sync()
-
 
 	def __setitem__(self, key, val):
 
+		# Ensure key is unicode
 		key = self._ensure_unicode(key)
 
-		# if there isn't already an entry, we need to allocate a new slot
+		# If we're making a new key, do so.
 		if key not in self._values:
 			self._keys.append(key)
 			self.index_lookup[key] = len(self._keys)-1
 
-		# update the value held at <key>
+		# Update the value held at ``key``
 		self._values[key] = val
 		self.mark_dirty(key)
-		self.maybe_sync()
-
-
-	def set(self, key, subkey, value):
-		"""
-		Modify fields of dict-valued keys in such a way that the change is 
-		registered for synchronization.  Recall that a POD is not aware of
-		modifications made directly to values that are mutable objects.
-		Equivalent to:
-
-		.. code-block:: python
-			my_pod[key][subkey] = value
-			self.update(key)
-
-		"""
-		key = self._ensure_unicode(key)
-		self[key][subkey] = value
-		self.update(key)
-
+		self._maybe_sync()
+		
 
 	def convert_to_tracker(self):
 
@@ -397,3 +564,6 @@ class PersistentOrderedDict(object):
 
 		self.unhold()
 
+
+# Make a shorter alias
+POD = PersistentOrderedDict

@@ -1,0 +1,11 @@
+README.rst
+setup.py
+tastypy/__init__.py
+tastypy/file_utils.py
+tastypy/persistent_ordered_dict.py
+tastypy/progress_tracker.py
+tastypy/shared_progress_tracker.py
+tastypy.egg-info/PKG-INFO
+tastypy.egg-info/SOURCES.txt
+tastypy.egg-info/dependency_links.txt
+tastypy.egg-info/top_level.txt
