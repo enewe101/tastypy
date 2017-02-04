@@ -8,7 +8,7 @@ tastypy
 
 .. py:module:: tastypy
 
-|copy| ``tastypy`` let's you easily interact with dict-like objects that are
+``tastypy`` let's you easily interact with dict-like objects that are
 "traslucently" persisted to disk.  It's designed to be used in cases where you
 need database-like functionality but don't want to actually create a database.
 A common use-case is in long-running programs, where you want to keep track of
