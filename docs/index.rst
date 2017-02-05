@@ -8,7 +8,7 @@ tastypy
 
 .. py:module:: tastypy
 
-|copy| ``tastypy`` let's you easily interact with dict-like objects that are
+``tastypy`` let's you easily interact with dict-like objects that are
 "traslucently" persisted to disk.  It's designed to be used in cases where you
 need database-like functionality but don't want to actually create a database.
 A common use-case is in long-running programs, where you want to keep track of
@@ -29,7 +29,7 @@ The ``tastypy.POD`` (which is the short spelling for
 transparently synchronizes to disk.  Supply a path when creating a ``POD``,
 and the data will be peristed using files at that location:
 
-.. code-block:: bash
+.. code-block:: python
 
     >>> from tastypy import POD
     >>> my_pod = POD('path/to/my.pod')
@@ -46,87 +46,185 @@ Data stored ``POD``\s is preserved after the program exits:
     bar
 
 
-JSON only
----------
-JSON is used as the serializaton for data in ``POD``\s, so only JSON-serializable
-data can be stored.  JSON is quite general, and represents the most common data 
-types naturally, but there are some limitations.  The choice to use JSON
-reflects the goal of keeping the design simple, having a human-readable format
-for the persistence files, and avoiding security issues (which would arise if
-using ``pickle``).
+JSON -- general, simple, secure
+-------------------------------
+JSON was selected as the serialization format, and the builtin ``json`` is the
+serializer.  JSON is general enough to represent pretty much any data, and
+unlike pickles, it is secure and interoperable between programs and python
+versions.  It has the added very handy advantage that the persistence files are
+human-readable, and are easily hacked manually or with unix tools or other
+programs.
 
-As a consequence, data stored in ``POD``\s must be JSON-serializable.  This
-means using integers, strings, as well as integers and strings in arbitrarily
-nested lists and dictionaries.  The ``POD``\ |s| keys, and the keys of
-dictionaries in values of a ``POD``, will be converted to strings.  All strings
-are converted to unicode by serialization.  Tuples can be used, but will be
-serialized as lists.
+While there are advantages to using ``json`` (great advantages), we also
+inheret some limitations.  Naturally, only JSON serializable data can
+be stored in a ``POD`` -- that means string-like, number-like, list-like, and
+dict-like objects (and arbitrarily nested combinations).
 
-Some of these restrictions could be relaxed by writing a for-purpose
-serializer, but that would limit interoperability and simplicity, expecially
-for people familiar with Python's ``json`` builtin.
+And we inherit the fact that ``json`` can slightly alter data in a cycle of
+serialization/deserialization:
 
-To illustrate some of the gotcha's
+    - string-like's become ``unicode``\ s (e.g. ``'a'`` becomes ``u'a'``)
+    - list-like's become ``list``\ s (e.g. ``(1,2)`` becomes ``[1,2]``)
+    - dict-like's become ``dict``\ s (e.g. ``Counter({'a':2})`` becomes ``{u'a':
+      2}``)
 
-.. code-block:: python
+It's actually a great idea to keep your data as application independant as
+possible, so one might view this as an *enabling* constraint.
 
-    >>> my_pod['integer-key'] = {1:'bar'}
-    >>> my_pod['tuple'] = ('baz', 42)
-    >>> exit()
+But there is one quirk of ``json`` that can be quite unexpected: 
 
-Notice that the key ``1`` is converted to a string (though ``42`` remains as a
-number), and the tuple is converted to a list.  That's just how ``json`` works.
+.. WARNING:: 
 
-.. code-block:: python
+    ``json`` converts integer keys of ``dict``\ s to strings
+    to comply with the JSON specification:
 
-    >>> my_pod['foo']
-    {u'1': u'bar'}
-    >>> my_pod['tuple']
-    [u'baz', 42]
+    .. code-block:: python
+
+        >>> my_pod[1] = {1:1}
+        >>> my_pod.sync(); my_pod.revert()  # do a serialize/deserialize cycle
+        >>> my_pod[1]
+        {'1':1}
+
+    Notice how the key in the stored dict turned from ``1`` into ``'1'``.  
+    
+With all its advantages, this tradeoff in using ``json`` seems well worth it.
+
 
 Synchronization
-===============
+---------------
 
-The ``POD`` was designed so that in most cases, synchronization between disk
-and memory is transparent.  The ``POD`` keeps track of which keys may have gone 
-out of sync with the disk, and periodically synchronizes
-(`customize synchronization`_).  A ``POD`` will always synchronize if it is
-destroyed or if the program exits or crashes, as long as the Python interpreter
-doesn't segfault, which is fairly rare.
+Generally you don't need to think about synchronization---that's the goal
+of ``tastypy``.  But it's good to understand the assumptions and limitations of
+the synchronization strategy so that you don't accidentally circumvent it.
 
-Any time you access keys, whether during assignment or some other manipulation,
-the ``POD`` considers that key to be *dirty*.  Once 1000 keys are dirty, the
-``POD`` will synchronize.  It's possible to circumvent synchronization if you
-create another reference to the contents of a key, and then interact with it
-via that reference.  But as long as you don't do that, your data will be kept
-in sync.
-
-So, the following will be properly synchronized:
+Under normal circumstances, the only thing you need to avoid is making changes
+to a datastructure's contents using a deep reference:
 
 .. code-block:: python
 
-    >>> my_pod['key'] = {}
-    >>> my_pod['key']['subkey1'] = 1 # __setitem__ called on dict, but only
-    >>> my_pod['key']['subkey2'] = []
-    >>> my_pod['key']['subkey2'].append(1)
+    >>> my_pod['key'] = {}                      # Good
+    >>> my_pod['key']['subkey1'] = 1            # Good
+    >>> my_pod['key']['subkey2'] = []           # Good
+    >>> my_pod['key']['subkey2'].append(1)      # Good
+    >>> #
+    >>> deep_reference = my_pod['key']          # Getting ready to do bad stuff
+    >>> deep_reference['subkey1'] = 2           # Bad!
+    >>> deep_reference['subkey2'].append(2)     # Bad!
 
-However, the following may not synchronize correctly:
+
+.. NOTE::
+
+    Generally, any change effected by accessing / setting a key on the
+    datastructure will be properly synchronizeded.  The datastructures mark
+    keys as dirty using the ``__getitem__`` and ``__setitem__`` methods.
+
+Synchronizing each time a value is written or accessed wouldn't be very
+performant.  So instead, datastructures keep track of which elements are
+"dirty", and synchronize them when the number of dirty elements reaches 1000
+(set this using the ``sync_at`` keyword argument to the constructor).
+
+Dirty values can be considered as having the same status as buffered data in a
+file object open for writing---if the program exits, crashes from an uncaught
+exception, or receives a SIGTERM or SIGINT (e.g. from ctrl-C), data will be
+synchronized.  However, in exceptional circumstances, such as the Python
+interpreter segfaulting or a SIGKILL signal, synchronization is impossible.  
+
+If for some reason you need to manually controll synchronization, you can. To
+synchronize all dirty values immediately, do ``POD.sync()``.  To synchronize a
+specific value use ``POD.update(key)``.  To flag a key dirty for the next
+synchronization, use ``POD.mark_dirty(key)``.  To get the set of dirty keys, do
+``POD.dirty()``.  You can suspend automatic synchronization using ``POD.hold()``,
+and reactivate it using ``POD.unhold()``.  To drop all un-sync'd changes and
+revert to the state stored on disk do ``POD.revert()``.
+
+Multiprocessing
+---------------
+Obviously opening multiple ``POD``\ s directed at the same location on disk is
+a bad idea.  Concurrent writes would likely result in stale data overriting, or
+corrupted files.  
+
+In a single-processing situation, you are actually protected
+from this because ``POD``\ s opened to the same normalized path on disk are
+actually singletons (technically Borgs).  This makes stale updates a
+non-issue in single-processed applications.
+
+In a multiprocessing context use a ``tastypy.SharedPOD``, which 
+handles inter-process synchronization concerns for you in the background.  
+Create the ``SharedPOD`` in the main process, and share it with child
+processes.
+
+.. WARNING::
+
+    Do not create multiple ``SharedPOD`` instances within child processes.
+    Create a single ``SharedPOD`` instance in a main process and share it with
+    the children.
+
+The ``SharedPOD`` is actually a proxy to a ``POD`` running in a background
+server process.  Processes can concurrently call any of the usual ``POD`` 
+methods on the ``SharedPOD``, and they will be interleaved safely.
+Alterations to values made by one process will be immediately visible to all 
+others, even if the underlying ``POD`` has not yet synchronized to disk.
+
+For the most part, you can interact with a ``SharedPOD`` just like a ``POD``,
+but one of the strategies for synchronizing can't be reliably done via proxy,
+which means that you need to be a bit more careful with how you mutate data.
+Only updates that make direct assignments to one of the ``SharedPOD``\ s keys
+can be properly synchronized.  The following are examples of good and bad
+approaches to changing values:
 
 .. code-block:: python
 
-    >>> value = {}
-    >>> my_pod['key'] = value   # This is ok
-    >>> value['subkey1'].append('foo')  # not seen, due to use of non-POD ref
-    >>> value['subkey2'] = 'baz'    # also not seen.
+    import tastypy
+    shared_pod = tastypy.SharedPOD('my.pod')
 
-A good rule of thumb is that a ``POD`` is not aware of lines of code in which
-it's name doesn't appear.
+    shared_pod['a'] = {'key': 42}               # Direct assignment to a key is always synchronized
+    
+    shared_pod['a']['key'] = 17                 # Assignment to a "subkey" is not!
+    shared_pod.mark_dirty('a')                  # Now it's synchronized.
+    
+    shared_pod.set(('a', 'key'), {})            # Assign to a subkey and synchronize in one step
+    shared_pod.set(('a', 'key', 'deeper'), 77)  # Go as deep as you want
+
+    shared_pod['a'].update({'other_key': 13})   # modifications to mutable types don't get synchronized
+    shared_pod.mark_dirty('a')                  # OK, synchronized!
+
+The following example shows how you can use a ``SharedPOD`` in a multiprocessed
+program:
+
+.. code-block:: python
+
+    from multiprocessing import Process
+    import tastypy
+
+    def worker(pod, proc_num, num_procs):
+        for i, key in enumerate(pod):
+            if i%num_procs == proc_num:
+                pod.set((key,'result'), pod[key]**2)
+
+    def run_multiproc():
+        num_procs = 5
+        pod = tastypy.SharedPOD('my.pod', init={str(i):i for i in range(1000)})
+        procs = []
+        for i in range(num_procs):
+            proc = Process(target=worker, args=(pod, i, num_procs)
+            proc.start()
+            procs.append(proc)
+
+        for proc in procs:
+            proc.join()
+
+    if __name__ == '__main__':
+        run_multiproc()
 
 
+
+
+``PersistentOrderedDict`` reference
+-----------------------------------
 
 .. py:class:: POD
 
-    Alias for PersistentOrderedDict
+    Alias for ``POD.PersistentOrderedDict``.
 
 .. autoclass:: PersistentOrderedDict
     :member-order: bysource
@@ -276,5 +374,6 @@ would cause lost data.
 
 
 .. |s| replace:: |rsquo|\ s
-.. |rsquo| unicode:: 0x2019 .. copyright sign
+.. |em| unicode:: 0x2014 .. em-dash
+.. |rsquo| unicode:: 0x2019 .. right single quote
 

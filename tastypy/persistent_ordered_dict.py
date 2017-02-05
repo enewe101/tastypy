@@ -132,36 +132,113 @@ class PersistentOrderedDict(object):
 		self, 
 		path,
 		gzipped=False,
+		init={},
 		file_size=DEFAULT_FILE_SIZE,
-		sync_at=DEFAULT_SYNC_AT
+		sync_at=DEFAULT_SYNC_AT,
 	):
 
 		path = tastypy.normalize_path(path)
-		if path not in self._SHARED_STATE:
-			self._SHARED_STATE[path] = {}
-		self.__dict__ = self._SHARED_STATE[path]
-
-		self.path = path
-		self.file_size = file_size
-		self.gzipped = gzipped
-		self.sync_at = sync_at
-
-		self._set_write_method(gzipped)
-
-		# Make the path in which files will be written.  If there's going to be
-		# a problem with writing, it should arise now
 		self._ensure_path(path)
+		self._borgify(path, gzipped, file_size)
 
-		# Load values from disk into memory.
-		self.revert()
 
-		# Hold is off by default, meaning that the record on disk is sync'ed
-		# automatically
+
+		# Different clones can have different sync_at and _hold values.
+		self.sync_at = sync_at
 		self._hold = False
 
-		# Always be sure to synchronize before the script exits
-		atexit.register(self.sync)
-		signal.signal(signal.SIGTERM, self._sync_on_terminate)
+		# Mix in any data specified to the init keyword argument
+		self.update(init)
+
+
+	def _borgify(self, path, gzipped, file_size):
+		# If an instance of this class has already been made, pointing at the
+		# same location on disk, then the new instance should share the same
+		# data and file-writing options.  In otherwords, multiple instances
+		# open to the same location on disk are really just interfaces to the
+		# same underlying data.  This makes stale-overriting a non-problem
+		# We use an approach inspired by Alex Martelli's "Borg" idea -- use
+		# class variables to create memory shared by all instances.  Instances
+		# can still differ in certain attributes, like how often they they
+		# synchronize to disk.
+
+		# We use the class_variable _SHARED_STATE to keep track of what PODs
+		# have been made (pointing to what locations on disk).  Check here to
+		# see if a POD pointing to this location has been made before, if so,
+		# we're making a "clone"
+		is_a_clone = path in self._SHARED_STATE
+
+		# If this instance is a clone, inherit data from the existing instnace 
+		if is_a_clone:
+			for key in self._SHARED_STATE[path]:
+				setattr(self, key, self._SHARED_STATE[path][key])
+
+			# Validate against the existing parameters that must be shared
+			if gzipped != self._gzipped:
+				raise ValueError(
+					'A POD instance pointed at the same location '
+					'exists and has a conflicting value for ``gzipped``.'
+				)
+
+			# Validate against the existing parameters that must be shared
+			if file_size != self._file_size:
+				raise ValueError(
+					'A POD instance pointed at the same location '
+					'exists and has a conflicting value for ``file_size``.'
+				)
+			
+		# Otherwise identify this objects data with the shared space
+		else:
+
+			# Create the shared space for PODs to this disk location
+			self._SHARED_STATE[path] = {
+				'_path': path,
+				'_values': {},
+				'_keys': [],
+				'_index_lookup': {},
+				'_dirty': set(),
+				'_open': open,
+				'_gzipped': gzipped,
+				'_file_size': file_size
+			}
+
+			# Identify with the shared space
+			for key in self._SHARED_STATE[path]:
+				setattr(self, key, self._SHARED_STATE[path][key])
+
+			# Load values from disk into memory.
+			self.revert()
+
+			# Register to synchronize before the script exits
+			atexit.register(self.sync)
+			signal.signal(signal.SIGTERM, self._sync_on_terminate)
+
+
+	def update(self, *mappings, **kwargs):
+		"""
+		Update self to reflect key-value mappings, and reflect key-value pairs
+		provided as keyword arguments.  Arguments closer to the right take 
+		precedence.  Mapping objects must either:
+
+			- be dict-like:
+
+				- implement .keys()
+				- act as an iterable over keys
+			  	- support key-based indexing e.g. mapping[key]
+
+			- be an iterable of key-value tuples
+		"""
+
+		for mapping in mappings:
+			if mapping.keys:
+				for key in mapping:
+					self.__setitem__(key, mapping[key])
+			else:
+				for key, val in mapping:
+					self.__setitem(key, val)
+
+		for key in kwargs:
+			self.__setitem__(key, kwargs[key])
 
 
 	def _sync_on_terminate(self, sig_num, frame):
@@ -212,7 +289,14 @@ class PersistentOrderedDict(object):
 		self._dirty.add(key)
 
 
-	def update(self, key):
+	def dirty(self):
+		"""
+		Return the set of dirty keys.
+		"""
+		return {key for key in self._dirty}
+
+
+	def sync_key(self, key):
 		'''
 		Force ``key`` to be synchronized to disk immediately.
 		'''
@@ -231,28 +315,27 @@ class PersistentOrderedDict(object):
 
 	def sync(self):
 		"""
-		Force synchronization of all "dirty" values (which have changed from
-		the values stored on disk).
+		Force synchronization of all dirty values.
 		"""
 		dirty_files = set()
 		for key in self._dirty:
-			index = self.index_lookup[key]
-			file_num = index / self.file_size
+			index = self._index_lookup[key]
+			file_num = index / self._file_size
 			dirty_files.add(file_num)
 
 		# The write directory should exist, but ensure it.
-		self._ensure_path(self.path)
+		self._ensure_path(self._path)
 
 		# Rewrite all the dirty files
 		for file_num in dirty_files:
 
 			# Get the dirty file
 			path =  self._path_from_int(file_num)
-			f = self.open(path, 'w')
+			f = self._open(path, 'w')
 
 			# Go through keys mapped to this file and re-write them
-			start = file_num * self.file_size
-			stop = start + self.file_size
+			start = file_num * self._file_size
+			stop = start + self._file_size
 			for key in self._keys[start:stop]:
 
 				value = self._values[key]
@@ -262,7 +345,7 @@ class PersistentOrderedDict(object):
 				f.write('%s\t%s\n' % (serialized_key, serialized_value))
 
 		# No more dirty keys
-		self._dirty = set()
+		self._dirty.clear()
 
 
 	def hold(self):
@@ -290,39 +373,31 @@ class PersistentOrderedDict(object):
 		self._read()
 
 		# Keep track of files whose contents don't match values in memory
-		self._dirty = set()
+		self._dirty.clear()
 
 
-	def copy(self, path, file_size, gzipped=False):
-		"""
-		Synchronize the POD to a new location on disk specified by ``path``.  
-		Future synchronization will also take place at this new location.  
-		The old location on disk will be left as-is and will no longer be 
-		synchronized.  When synchronizing store ``file_size`` number of
-		values per file, and keep files gzipped if ``gzipped`` is ``True``.
-		This is not affected by ``hold()``.
-		"""
+	#def copy(self, path, file_size, gzipped=False):
+	#	"""
+	#	Synchronize the POD to a new location on disk specified by ``path``.  
+	#	Future synchronization will also take place at this new location.  
+	#	The old location on disk will be left as-is and will no longer be 
+	#	synchronized.  When synchronizing store ``file_size`` number of
+	#	values per file, and keep files gzipped if ``gzipped`` is ``True``.
+	#	This is not affected by ``hold()``.
+	#	"""
 
-		self.gzipped = gzipped
-		self.path = path
-		self.file_size = file_size
+	#	self.gzipped = gzipped
+	#	self._path = path
+	#	self._file_size = file_size
 
-		self._set_write_method(gzipped)
-		self._ensure_path(path)
+	#	self._set_write_method(gzipped)
+	#	self._ensure_path(path)
 
-		num_files = int(math.ceil(
-			len(self._values) / float(self.file_size)
-		))
-		self._dirty_files = set(range(num_files))
-		self.sync()
-
-
-	def _set_write_method(self, gzipped):
-
-		if gzipped:
-			self.open = gzip.open
-		else:
-			self.open = open
+	#	num_files = int(math.ceil(
+	#		len(self._values) / float(self._file_size)
+	#	))
+	#	self._dirty_files = set(range(num_files))
+	#	self.sync()
 
 
 	def _ensure_path(self, path):
@@ -341,20 +416,20 @@ class PersistentOrderedDict(object):
 
 	def _path_from_int(self, i):
 		# Get the ith synchronization file's full path.
-		if self.gzipped:
-			return os.path.join(self.path, '%d.json.gz' % i)
+		if self._gzipped:
+			return os.path.join(self._path, '%d.json.gz' % i)
 		else:
-			return os.path.join(self.path, '%d.json' % i)
+			return os.path.join(self._path, '%d.json' % i)
 
 
 	def _read(self):
 		# Read persisted data from disk.  This is when the POD is initialized.
-		self._keys = []
-		self.index_lookup = {}
-		self._values = {}
+		self._keys[:] = []
+		self._index_lookup.clear()
+		self._values.clear()
 
 		for i, fname in enumerate(
-			tastypy.ls(self.path, dirs=False, absolute=True
+			tastypy.ls(self._path, dirs=False, absolute=True
 		)):
 
 			# ensure that files are in expected order,
@@ -368,16 +443,16 @@ class PersistentOrderedDict(object):
 			if i > 0:
 				prev_file_path = self._path_from_int(i-1)
 				num_lines_prev_file = len(
-					self.open(prev_file_path, 'r').readlines()
+					self._open(prev_file_path, 'r').readlines()
 				)
-				if num_lines_prev_file != self.file_size:
+				if num_lines_prev_file != self._file_size:
 					raise tastypy.PersistentOrderedDictIntegrityError(
 						"PersistentOrderedDict: "
 						"A file on disk appears to be corrupted, because "
 						"it has the wrong number of lines: %s " % prev_file_path
 					)
 
-			for entry in self.open(os.path.join(fname)):
+			for entry in self._open(os.path.join(fname)):
 
 				# skip blank lines (there's always one at end of file)
 				if entry=='':
@@ -403,7 +478,7 @@ class PersistentOrderedDict(object):
 
 				self._values[key] = value
 				self._keys.append(key)
-				self.index_lookup[key] = len(self._keys)-1
+				self._index_lookup[key] = len(self._keys)-1
 
 
 	def _serialize_key(self, key, recursed=False):
@@ -480,7 +555,7 @@ class PersistentOrderedDict(object):
 
 	def __contains__(self, key):
 		key = self._ensure_unicode(key)
-		return key in self.index_lookup
+		return key in self._index_lookup
 
 
 	def __len__(self):
@@ -539,7 +614,7 @@ class PersistentOrderedDict(object):
 		# If we're making a new key, do so.
 		if key not in self._values:
 			self._keys.append(key)
-			self.index_lookup[key] = len(self._keys)-1
+			self._index_lookup[key] = len(self._keys)-1
 
 		# Update the value held at ``key``
 		self._values[key] = val

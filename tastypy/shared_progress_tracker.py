@@ -5,6 +5,11 @@ tracker and can be accessed from different processes without any need to worry
 about synchronization.
 '''
 
+# TODO: need to have mark_dirty send that key's value using the "set" command
+#	or something, and test it.
+# TODO: add the dirty command and other commands recently added to the POD
+# TODO: add the init constructor argument
+
 import sys
 import multiprocessing
 import tastypy
