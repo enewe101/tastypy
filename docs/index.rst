@@ -8,50 +8,50 @@ tastypy
 
 .. py:module:: tastypy
 
-``tastypy`` provides dict-like datastructures that transprently persist to to
-disk.  this is helpful in cases where you need a persisted key-value store but
-don't want to make a database.  for example, it could be used to keep track of
-the status of urls in a crawler, or of tasks in a long-running process,
+``tastypy`` provides dict-like datastructures that transparently persist to to
+disk.  This is helpful in cases where you need a persisted key-value store but
+don't want to make a database.  For example, it could be used to keep track of
+the status of URLs in a crawler, or of tasks in a long-running process,
 enabling the process to pick up where it left off after a crash or
 interruption.
 
-install
+Install
 =======
 .. code-block:: bash
 
     pip install tastypy
 
-``persistentordereddict``
+``PersistentOrderedDict``
 =========================
 
-the ``tastypy.pod`` (short alias for ``tastypy.persistentordereddict``) is a
-dict-like datastructure that transparently synchronizes to disk.  supply a path
-when creating a ``pod``, and the data will be peristed using files at that
+The ``tastypy.pod`` (short alias for ``tastypy.PersistentOrderedDict``) is a
+dict-like datastructure that transparently synchronizes to disk.  Supply a path
+when creating a ``POD``, and the data will be persisted using files at that
 location:
 
 .. code-block:: python
 
-    >>> from tastypy import pod
+    >>> from tastypy import POD
     >>> my_pod = pod('path/to/my.pod')
     >>> my_pod['foo'] = 'bar'
     >>> exit()
 
-data stored ``pod``\s is preserved after the program exits:
+Data stored ``POD``\s is preserved after the program exits:
 
 .. code-block:: python
 
-    >>> from tastypy import pod
+    >>> from tastypy import POD
     >>> my_pod = pod('path/to/my.pod')
     >>> my_pod['foo']
     bar
 
 
-json -- general, simple, secure
+JSON -- general, simple, secure
 -------------------------------
-data is serialized in json format using the builtin ``json`` module for
-serialization and deserialization.  json is general enough to represent pretty
+Data is serialized in JSON format using the builtin ``json`` module for
+serialization and deserialization.  JSON is general enough to represent pretty
 much any data, and unlike pickles, it is secure, and interoperable across
-programs and python versions.  the persistence files are human-readable, and 
+programs and python versions.  The persistence files are human-readable, and 
 easily hacked manually or with other tools.
 
 While there are advantages to using ``json``, there are also some limitations.
@@ -92,7 +92,7 @@ be properly synchronized.  However, if you make a reference to a mutable type st
 in the ``POD``, and then mutate it using that reference, there is no way for
 the ``POD`` to know about it, and that change will not be persisted.
 
-In otherwords, don't do this:
+In other words, don't do this:
 
 .. code-block:: python
 
@@ -360,7 +360,7 @@ SharedPersistentOrderedDict reference
 
 The ``tastypy.Tracker`` (short for ``tastypy.ProgressTracker``) is a subclass
 of the ``POD`` that helps track the progress of long-running programs that
-involve performing many repetative tasks, so that the program can pick up where
+involve performing many repetitive tasks, so that the program can pick up where
 it left off in case of a crash. 
 
 Each value in a tracker represents one task and stores whether that task is
@@ -373,7 +373,7 @@ to some maximum number of attempts.
 
 To motivate the ``ProgressTracker`` and illustrate how it works, let's imagine
 that we are crawling a website.  Let's begin with an example that uses a
-regular ``POD`` like a queue for the urls that need to be crawled.  That would
+regular ``POD`` like a queue for the URLs that need to be crawled.  That would
 look something like this:
 
 .. code-block:: python
@@ -458,7 +458,7 @@ tracker!
 Multiprocessing with ``SharedProgressTracker``\ s
 =================================================
 Just as you can distribute a ``SharedPOD`` to multiple processes, you can
-distrubute a ``SharedTracker`` (short alias for ``SharedProgressTracker``) to
+distribute a ``SharedTracker`` (short alias for ``SharedProgressTracker``) to
 multiple processes.
 
 The same basic usage applies.  A single ``SharedTracker`` should be made and
