@@ -18,9 +18,8 @@ from tblib import pickling_support
 pickling_support.install()
 
 
-print 'DEBUG -- RESET CHUNK SIZES!'
-ITERITEMS_CHUNK_SIZE = 100
-ITERKEYS_CHUNK_SIZE = 100
+ITERITEMS_CHUNK_SIZE = 1000
+ITERKEYS_CHUNK_SIZE = 1000
 
 def _requires_lock(lock):
 	def decorator(f):
@@ -206,7 +205,6 @@ class SharedPersistentOrderedDict(object):
 		# server, where those methods get called on the actual POD.  The return
 		# value is sent back from the server, along with any errors that were
 		# raised, so that they can be returned / raised here.
-		print 'passthrough!'
 		self.client_pipe.send((method_name, args, kwargs))
 		return_val, error = self.client_pipe.recv()
 		if error is not None:

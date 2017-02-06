@@ -121,7 +121,6 @@ class PersistentOrderedDict(object):
 	#	_deep_setitem(self, key_tuple, val)
 	#	#print 'POD:', key_tuple, '<--', val
 	def _call_deep(self, key_tuple, method_name, *args, **kwargs):
-		print 'POD:', key_tuple, method_name, args, kwargs
 		target = _deep_getitem(self, key_tuple)
 		getattr(target, method_name)(*args, **kwargs)
 		if len(key_tuple):
