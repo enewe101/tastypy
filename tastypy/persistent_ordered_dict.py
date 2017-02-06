@@ -41,52 +41,6 @@ def _deep_getitem(container, key_tuple):
 	return value
 
 
-class DeepKey(object):
-
-	def __init__(
-		self, 
-		callback=None,
-		parent_deepkey=None,
-		parent_key=None
-	):
-		self.callback = callback
-		self.parent_deepkey = parent_deepkey
-		self.parent_key = parent_key
-
-		validates_as_root_key = (
-			callback is not None and parent_key is None
-		)
-		validates_as_deep_key = (
-			callback is None and parent_key is not None
-		)
-		if validates_as_root_key:
-			self.placement = 'root'
-		elif validates_as_deep_key:
-			self.placement = 'deep'
-		else:
-			raise ValueError(
-				'Either provide callback or provide both parent_deepkey '
-				'and parent_key'
-			)
-
-	def __getitem__(self, key):
-		return DeepKey(parent_deepkey=self, parent_key=key)
-
-	def __setitem__(self, key, val):
-		if self.placement == 'deep':
-			self.parent_deepkey.setitem((self.parent_key, key,), val)
-
-		else:
-			self.callback((key,), val)
-
-	def setitem(self, keys, val):
-		if self.placement == 'deep':
-			self.parent_deepkey.setitem((self.parent_key,) + keys, val)
-		else:
-			self.callback(keys, val)
-
-
-
 class Mutator(object):
 	def __init__(self, client):
 		self.client = client
@@ -110,38 +64,45 @@ class SingletonDecorator:
 
 class PersistentOrderedDict(object):
 	""" 
-	A key-value mapping container that synchronizes transparently to disk at
-	the location given by ``path``.  Data will persist after program
+	A key-value mapping that synchronizes transparently to disk at the location
+	given by ``path``.  When treated as an iterable, it yields keys in the
+	order in which they were originally added. Data will persist after program
 	interruption and can be accessed by creating a new instance directed at the
-	same path.  The JSON-formatted persistence files are gzipped if ``gzipped`` 
-	is ``True``.  Each files stores a number of values given by
-	``file_size``.  Smaller values give faster synchronization but create 
-	more files.  Synchronization automatically occurs when the number of
-	values that are out of sync with those stored on disk reaches ``sync_at``
-	or if the program terminates.
+	same path.  
+
+	Provide initial data to initialize (or update) the mapping using the
+	``init`` parameter.  The argument should be an iterable of key-value tuples
+	or should implement ``iteritems()`` yielding such an iterable.  This is
+	equivalent to calling ``update(init_arg)`` after creating the ``POD``.	
+
+	The JSON-formatted persistence files are gzipped if ``gzipped`` is
+	``True``.    Each file stores a number of values given by ``file_size``.
+	Smaller values give faster synchronization but create more files.  Data is
+	automatically synchronized to disk when the number of "dirty" values
+	reaches ``sync_at``, or if the program terminates.
 	"""
 
 	_ESCAPE_TAB_PATTERN = re.compile('\t')
 	_UNESCAPE_TAB_PATTERN = re.compile(r'(?P<prefix>^|[^\\])\\t')
 	_ESCAPE_SLASH_PATTERN = re.compile(r'\\')
 	_UNESCAPE_SLASH_PATTERN = re.compile(r'\\\\')
-
 	_SHARED_STATE = {}
 
 	def __init__(
 		self, 
 		path,
-		gzipped=False,
 		init={},
+		gzipped=False,
 		file_size=DEFAULT_FILE_SIZE,
 		sync_at=DEFAULT_SYNC_AT,
 	):
-
+		# In addition to initializing some of the attributes fo the POD, we'll
+		# also identify many of them with class attributes, which produces
+		# singleton-like behavior, and protects against stale overwrites if
+		# multiple PODs are created that point at the same location on disk
 		path = tastypy.normalize_path(path)
 		self._ensure_path(path)
 		self._borgify(path, gzipped, file_size)
-
-
 
 		# Different clones can have different sync_at and _hold values.
 		self.sync_at = sync_at
@@ -149,6 +110,31 @@ class PersistentOrderedDict(object):
 
 		# Mix in any data specified to the init keyword argument
 		self.update(init)
+
+		self.set = tastypy._DeepProxy(
+			#self._set_deep,
+			self._call_deep
+		)
+
+
+	#def _set_deep(self, key_tuple, val):
+	#	_deep_setitem(self, key_tuple, val)
+	#	#print 'POD:', key_tuple, '<--', val
+	def _call_deep(self, key_tuple, method_name, *args, **kwargs):
+		print 'POD:', key_tuple, method_name, args, kwargs
+		target = _deep_getitem(self, key_tuple)
+		getattr(target, method_name)(*args, **kwargs)
+		if len(key_tuple):
+			self.mark_dirty(key_tuple[0])
+			self._maybe_sync()
+
+
+	#def set(self, key_tuple, value):
+	#	main_key = self._ensure_unicode(key_tuple[0])
+	#	key_tuple = (main_key,) + key_tuple[1:]
+	#	_deep_setitem(self, key_tuple, value)
+	#	self.mark_dirty(key_tuple[0])
+	#	self._maybe_sync()
 
 
 	def _borgify(self, path, gzipped, file_size):
@@ -218,24 +204,17 @@ class PersistentOrderedDict(object):
 		"""
 		Update self to reflect key-value mappings, and reflect key-value pairs
 		provided as keyword arguments.  Arguments closer to the right take 
-		precedence.  Mapping objects must either:
-
-			- be dict-like:
-
-				- implement .keys()
-				- act as an iterable over keys
-			  	- support key-based indexing e.g. mapping[key]
-
-			- be an iterable of key-value tuples
+		precedence.  Mapping objects must either be iterables of key-value
+		tuples or implement ``iteritems()`` yielding such an iterator.
 		"""
 
 		for mapping in mappings:
-			if mapping.keys:
+			if hasattr(mapping, 'keys'):
 				for key in mapping:
 					self.__setitem__(key, mapping[key])
 			else:
 				for key, val in mapping:
-					self.__setitem(key, val)
+					self.__setitem__(key, val)
 
 		for key in kwargs:
 			self.__setitem__(key, kwargs[key])
@@ -247,43 +226,61 @@ class PersistentOrderedDict(object):
 		sys.exit(0)
 
 
-	def keys(self):
+	def __iter__(self):
+		return self._keys.__iter__()
+
+	def iteritems(self):
 		"""
-		Return a list of the keys, matching the order in which they were added.
+		Provide an iterator of key-value tuples in the order in which keys were
+		added.
 		"""
-		return [key for key in self._keys]
+		for key in self._keys:
+			yield key, self._values.__getitem__(key)
 
 
-	def values(self):
+	def iterkeys(self):
 		"""
-		Return a list of the ``POD``'s values.  The order of values is
-		guaranteed to match the order of ``self.keys()``
+		Provide an iterator over keys in the order in which they were added.
 		"""
-		return [self.__getitem__(key) for key in self._keys]
+		return self._keys.__iter__()
 
+
+	def itervalues(self):
+		"""
+		Provide an iterator over values in the order in which corresponding
+		keys were added.
+		"""
+		for key in self._keys:
+			yield self._values.__getitem__(key)
 
 
 	def items(self):
 		"""
-		Return a list of key-value pairs, matching the order in which keys were 
+		Return a list of key-value tuples in the order in which keys were
 		added.
 		"""
-		return [(key, self.__getitem__(key)) for key in self._keys]
+		return [(key, self._values.__getitem__(key)) for key in self._keys]
 
 
-	def iteritems(self):
+	def keys(self):
 		"""
-		Return an iterator that yields key-value pairs, matching the order
-		in which keys were added.
+		Return a list of keys in the order in which they were added.
 		"""
-		for key in self._keys:
-			yield key, self.__getitem__(key)
+		return list(self._keys)
+
+
+	def values(self):
+		"""
+		Return a list of values in the order in which the corresponding keys
+		were added.
+		"""
+		return [self._values.__getitem__(key) for key in self._keys]
 
 
 	def mark_dirty(self, key):
 		"""
 		Force ``key`` to be considered out of sync.  The data associated to
-		this key will be re-written to file during the next synchronization.
+		this key will be written to file during the next synchronization.
 		"""
 		key = self._ensure_unicode(key)
 		self._dirty.add(key)
@@ -293,7 +290,7 @@ class PersistentOrderedDict(object):
 		"""
 		Return the set of dirty keys.
 		"""
-		return {key for key in self._dirty}
+		return set(self._dirty)
 
 
 	def sync_key(self, key):
@@ -303,14 +300,6 @@ class PersistentOrderedDict(object):
 		key = self._ensure_unicode(key)
 		self.mark_dirty(key)
 		self.sync()
-
-
-	def set(self, key_tuple, value):
-		main_key = self._ensure_unicode(key_tuple[0])
-		key_tuple = (main_key,) + key_tuple[1:]
-		_deep_setitem(self, key_tuple, value)
-		self.mark_dirty(key_tuple[0])
-		self._maybe_sync()
 
 
 	def sync(self):
@@ -350,7 +339,9 @@ class PersistentOrderedDict(object):
 
 	def hold(self):
 		"""
-		Suspend automatic synchronization to disk.
+		Suspend the automatic synchronization to disk that normally occurs when
+		the number of dirty values reaches ``sync_at``.  (Synchronization will
+		still be carried out at termination.)
 		"""
 		self._hold = True
 
@@ -360,13 +351,12 @@ class PersistentOrderedDict(object):
 		Resume automatic synchronization to disk.
 		"""
 		self._hold = False
-		self.maybe_sync()
+		self._maybe_sync()
 
 
 	def revert(self):
 		"""
 		Load values from disk into memory, discarding any unsynchronized changes.
-		Forget any files have been marked "dirty".
 		"""
 
 		# read in all data (if any)
@@ -535,22 +525,6 @@ class PersistentOrderedDict(object):
 			return
 		self.sync()
 
-
-
-	def __iter__(self):
-		self.pointer = 0
-		return self
-
-
-	def next(self):
-		try:
-			key = self._keys[self.pointer]
-		except IndexError:
-			raise StopIteration
-
-		self.pointer += 1
-
-		return key
 
 
 	def __contains__(self, key):

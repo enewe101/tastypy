@@ -4,6 +4,7 @@ from .exceptions import (
 	PersistentOrderedDictIntegrityError,
 )
 
+from ._deep_proxy import DeepProxy as _DeepProxy
 from .file_utils import ls, normalize_path
 
 # Make the interesting classes available as direct import from the module
@@ -14,8 +15,7 @@ from .persistent_ordered_dict import (
 # import of progress_tracker must come after persistent_ordered_dict, because
 # progress_tracker module initialization requires persisitent_ordered_dict
 # to already be loaded in tastypy
-from .progress_tracker import (
-	_ProgressTracker, ProgressTracker, _Tracker, Tracker, Trackers)
+from .progress_tracker import ProgressTracker, Tracker
 
 # Initialization of shared_progress_tracker requires that progress_tracker has
 # already been imported into tastypy

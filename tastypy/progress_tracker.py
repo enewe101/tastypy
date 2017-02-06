@@ -9,31 +9,132 @@ crash or suspension.
 import tastypy
 
 
-Trackers = {}
-def ProgressTracker(path, *args, **kwargs):
-	path = tastypy.normalize_path(path)
-	try:
-		return Trackers[path]
-	except KeyError:
-		Trackers[path] = _ProgressTracker(path, *args, **kwargs)
-		return Trackers[path]
-
-Tracker = ProgressTracker
-
 
 # TODO: override setitem so that new top-level keys can't be added without an
 # explicit call to ``.add()``.
-class _ProgressTracker(tastypy.PersistentOrderedDict):
-	"""ProgressTracker(path)
+class ProgressTracker(tastypy.PersistentOrderedDict):
 
-	A specialized subclass of POD whose values are all dictionaries
-	representing the status of tasks or items to be "done", with convenience
-	functions for keeping track of the number of times items have been tried.
-	Synchronizing disk using files stored under ``path``.  If ``gzipped`` is
-	``True``, then gzip the persistence files.  ``lines_per_file`` determines
-	how many of the ``Tracker``\ |s| values are stored in a single before creating
-	a new one.
 	"""
+	A specialized subclass of ``POD`` for tracking tasks, whose values are
+	dicts representing whether the task has been done and how many times it has
+	been tried.  
+
+	Transprantly aynchronizes to disk using files stored under ``path``.  
+	Specify the maximum number of times a task should be tried using 
+	``max_tries``, which influences which tasks are tried under certain
+	iteration modes.  If ``max_tries`` is ``0`` no limit is applied.
+
+	Provide initial data to initialize (or update) the mapping using the
+	``init`` parameter.  The argument should be an iterable of key-value tuples
+	or should implement ``iteritems()`` yielding such an iterable.  This is
+	equivalent to calling ``update(init_arg)`` after creating the ``POD``.	
+
+	The JSON-formatted persistence files are gzipped if ``gzipped`` is
+	``True``.    Each file stores a number of values given by ``file_size``.
+	Smaller values give faster synchronization but create more files.  Data is
+	automatically synchronized to disk when the number of "dirty" values
+	reaches ``sync_at``, or if the program terminates.
+	"""
+
+	def __init__(
+		self, 
+		path,
+		max_tries=0,
+		init={},
+		gzipped=False,
+		file_size=tastypy.DEFAULT_FILE_SIZE,
+		sync_at=tastypy.DEFAULT_SYNC_AT,
+	):
+		super(ProgressTracker, self).__init__(
+			path, init, gzipped, file_size, sync_at)
+		self.max_tries = max_tries
+
+
+	def abort(self, key):
+		"""
+		Mark the ``key`` aborted.
+		"""
+		key = self._ensure_unicode(key)
+
+		# If the key wasn't already marked aborted, then increment the total
+		# number of aborted keys, and mark this key aborted.
+		if not self[key]['_aborted']:
+			self._num_aborted += 1
+			self[key]['_aborted'] = True
+			self.mark_dirty(key)
+			self.maybe_sync()
+
+
+	def unabort(self, key):
+		"""
+		Mark the ``key`` not aborted.
+		"""
+		key = self._ensure_unicode(key)
+
+		# If the key was aborted, then decremet the total number of aborted
+		# keys, and update this key to be not aborted.
+		if self[key]['_aborted']:
+			self._num_aborted -= 1
+			self[key]['_aborted'] = False
+			self.mark_dirty(key)
+			self.maybe_sync()
+
+
+	def is_aborted(self, key):
+		return self._values[key]['_aborted']
+
+
+	def todo_keys(self):
+		"""
+		Provide an iterator over keys not yet marked done and with fewer tries
+		than max_tries.
+		"""
+		for key in self._keys:
+			val = self._values[key]
+			worth_trying = self.max_tries < 1 or val['_tries'] < self.max_tries
+			if not val['_done'] and worth_trying:
+				yield key
+
+	def todo_items(self):
+		"""
+		Provide an iterator of key-value tuples for keys not yet marked done and 
+		with fewer than max_tries.
+		"""
+		for key in self.todo_keys:
+			yield key, self._values[key]
+
+	def todo_values(self):
+		"""
+		Provide an iterator over values corresponding to keys not yet marked 
+		done and with fewer than max_tries.
+		"""
+		for key in self.todo_keys:
+			yield key, self._values[key]
+
+	def try_keys(self):
+		"""
+		Provide an iterator over keys not yet marked done and with fewer tries
+		than max_tries.  Increment the number of tries for each key yielded.
+		"""
+		for key in self.todo_keys:
+			self.increment_tries(key)
+			yield key
+
+	def try_items(self):
+		"""
+		Provide an iterator over keys  not yet marked done and with fewer tries
+		than max_tries. Increment the number of tries for each item yielded.
+		"""
+		for key in self.try_keys():
+			return key, self._values[key]
+
+	def try_values(self):
+		"""
+		Provide an iterator over keys not yet marked done and with fewer tries
+		than max_tries.  Increment the number of tries for each value yielded.
+		"""
+		for key in self.try_keys():
+			return self._values[key]
 
 	def check_or_add(self, key):
 		"""
@@ -88,12 +189,31 @@ class _ProgressTracker(tastypy.PersistentOrderedDict):
 			pass
 
 
+	def add_many(self, keys_iterable):
+		"""
+		Add each key yielded by keys iterator, initialized as not done, 
+		with zero tries.
+		"""
+		for key in keys_iterable:
+			self.add(key)
+
+
+	def add_many_if_absent(self, keys_iterable):
+		"""
+		Same as add_many, but silently skip keys that are already in the
+		tracker.
+		"""
+		for key in keys_iterable:
+			self.add_if_absent(key)
+
+
 	def _read(self):
 		# Perform ``_read()`` as for POD, but first initialize counters for the
 		# number of keys that are done and number of keys that have been tried.
 		self._num_done = 0
 		self._num_tried = 0
-		super(_ProgressTracker, self)._read()
+		self._num_aborted = 0
+		super(ProgressTracker, self)._read()
 
 
 	def _read_intercept(self, key, value):
@@ -258,5 +378,4 @@ class _ProgressTracker(tastypy.PersistentOrderedDict):
 		return formatter % (100 * fraction)
 
 
-# Make a shorter alias
-_Tracker = _ProgressTracker
+Tracker = ProgressTracker
