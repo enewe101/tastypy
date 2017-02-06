@@ -24,7 +24,7 @@ Install
 ``PersistentOrderedDict``
 =========================
 
-The ``tastypy.pod`` (short alias for ``tastypy.PersistentOrderedDict``) is a
+The ``tastypy.POD`` (short alias for ``tastypy.PersistentOrderedDict``) is a
 dict-like datastructure that transparently synchronizes to disk.  Supply a path
 when creating a ``POD``, and the data will be persisted using files at that
 location:
