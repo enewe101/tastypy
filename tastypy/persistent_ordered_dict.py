@@ -1,17 +1,18 @@
-'''
+"""
 The persistent ordered dict is a data struture that can be interacted with
 like a python dict, and which is easy to keep synced with an on-disk copy
 
 This allows you to easily persist data between non-concurrent runs of a
 program.  It's useful for keeping track of progress in long jobs.
-'''
+"""
+
+# TODO keys should be converted to a special internal type that knows if it's
+# unicode escaped.  Or, in otherwords, we should be checking if keys are
+# unicode in getitem and setitem.
 
 import tastypy
-import math
 import atexit
-import json
 import os
-import re
 import copy
 import gzip
 import signal
@@ -20,14 +21,6 @@ import sys
 
 DEFAULT_FILE_SIZE = 1000
 DEFAULT_SYNC_AT = 1000
-
-def tuplify_lists(obj):
-	if isinstance(obj, list):
-		for i, element in enumerate(obj):
-			obj[i] = tuplify_lists(element)
-		obj = tuple(obj)
-	return obj
-
 
 def _deep_setitem(container, key_tuple, value):
 	owner = _deep_getitem(container, key_tuple[:-1])
@@ -80,13 +73,13 @@ class PersistentOrderedDict(object):
 	Smaller values give faster synchronization but create more files.  Data is
 	automatically synchronized to disk when the number of "dirty" values
 	reaches ``sync_at``, or if the program terminates.
+
+	``PersistentOrderedDict``\ s opened to the same file path share underlying
+	memory so that they don't stale over-write one another's data.  Setting
+	``clone`` to true gives the instance it's own memory space.
 	"""
 
-	_ESCAPE_TAB_PATTERN = re.compile('\t')
-	_UNESCAPE_TAB_PATTERN = re.compile(r'(?P<prefix>^|[^\\])\\t')
-	_ESCAPE_SLASH_PATTERN = re.compile(r'\\')
-	_UNESCAPE_SLASH_PATTERN = re.compile(r'\\\\')
-	_SHARED_STATE = {}
+	_SHARED_POD_STATE = {}
 
 	def __init__(
 		self, 
@@ -95,6 +88,7 @@ class PersistentOrderedDict(object):
 		gzipped=False,
 		file_size=DEFAULT_FILE_SIZE,
 		sync_at=DEFAULT_SYNC_AT,
+		clone=True
 	):
 		# In addition to initializing some of the attributes fo the POD, we'll
 		# also identify many of them with class attributes, which produces
@@ -102,7 +96,10 @@ class PersistentOrderedDict(object):
 		# multiple PODs are created that point at the same location on disk
 		path = tastypy.normalize_path(path)
 		self._ensure_path(path)
-		self._borgify(path, gzipped, file_size)
+		self._init_sharable_attrs(path, gzipped, file_size, clone)
+
+		# Bind the file opening algorithm to self's namespace
+		self._open = gzip.open if gzipped else open
 
 		# Different clones can have different sync_at and _hold values.
 		self.sync_at = sync_at
@@ -117,46 +114,62 @@ class PersistentOrderedDict(object):
 		)
 
 
-	#def _set_deep(self, key_tuple, val):
-	#	_deep_setitem(self, key_tuple, val)
-	#	#print 'POD:', key_tuple, '<--', val
 	def _call_deep(self, key_tuple, method_name, *args, **kwargs):
+
 		target = _deep_getitem(self, key_tuple)
-		getattr(target, method_name)(*args, **kwargs)
+		target_ancester = _deep_getitem(self, key_tuple[:-1])
+		try:
+			return_val = getattr(target, method_name)(*args, **kwargs)
+		except AttributeError:
+			if method_name.startswith('__i'):
+				method_name = '__' + method_name[3:]
+				return_val = getattr(target, method_name)(*args, **kwargs)
+			else:
+				raise
+			
 		if len(key_tuple):
 			self.mark_dirty(key_tuple[0])
 			self._maybe_sync()
 
-
-	#def set(self, key_tuple, value):
-	#	main_key = self._ensure_unicode(key_tuple[0])
-	#	key_tuple = (main_key,) + key_tuple[1:]
-	#	_deep_setitem(self, key_tuple, value)
-	#	self.mark_dirty(key_tuple[0])
-	#	self._maybe_sync()
+		return return_val
 
 
-	def _borgify(self, path, gzipped, file_size):
-		# If an instance of this class has already been made, pointing at the
-		# same location on disk, then the new instance should share the same
-		# data and file-writing options.  In otherwords, multiple instances
-		# open to the same location on disk are really just interfaces to the
-		# same underlying data.  This makes stale-overriting a non-problem
-		# We use an approach inspired by Alex Martelli's "Borg" idea -- use
-		# class variables to create memory shared by all instances.  Instances
-		# can still differ in certain attributes, like how often they they
-		# synchronize to disk.
+	# We access the shared state through a method so that subclasses can use
+	# different shared state to isolate themselves.
+	def _get_shared_state(self):
+		return self._SHARED_POD_STATE
 
-		# We use the class_variable _SHARED_STATE to keep track of what PODs
-		# have been made (pointing to what locations on disk).  Check here to
-		# see if a POD pointing to this location has been made before, if so,
-		# we're making a "clone"
-		is_a_clone = path in self._SHARED_STATE
 
-		# If this instance is a clone, inherit data from the existing instnace 
-		if is_a_clone:
-			for key in self._SHARED_STATE[path]:
-				setattr(self, key, self._SHARED_STATE[path][key])
+	def _shared_attrs(self, path, gzipped, file_size):
+		return {
+			'_path': path,
+			'_values': {},
+			'_keys': [],
+			'_index_lookup': {},
+			'_dirty': set(),
+			'_open': open,
+			'_gzipped': gzipped,
+			'_file_size': file_size
+		}
+
+
+	def _init_sharable_attrs(self, path, gzipped, file_size, clonable):
+		# Instances that point to the same location are made to be "clones" of
+		# eachother, by pointing certain "sharable attributes" at the same memory
+		# location (using class variables).  This prevents them from
+		# stale-overwriting one anothers data, because they share the same
+		# data.  Howver if clonable is False, then we don't put the sharable
+		# attributes on class variables, keeping them isolated.
+
+		# Dose a clone already exist?
+		clone_already_exists = path in self._get_shared_state()
+
+		# If we're cloning a pre-existing clone, retrieve shared attrs, and 
+		# check for consistency in file handling with the existing clone
+		if clonable and clone_already_exists:
+
+			for key in self._get_shared_state()[path]:
+				setattr(self, key, self._get_shared_state()[path][key])
 
 			# Validate against the existing parameters that must be shared
 			if gzipped != self._gzipped:
@@ -171,25 +184,28 @@ class PersistentOrderedDict(object):
 					'A POD instance pointed at the same location '
 					'exists and has a conflicting value for ``file_size``.'
 				)
-			
-		# Otherwise identify this objects data with the shared space
+
+		# If clonable, but no clone existed, initialize sharable attrs
+		elif clonable and not clone_already_exists:
+
+			if clonable:
+
+				# Create the shared space for PODs to this disk location
+				self._get_shared_state()[path] = self._shared_attrs(
+					path,gzipped,file_size)
+
+				# Identify with the shared space
+				for key in self._get_shared_state()[path]:
+					setattr(self, key, self._get_shared_state()[path][key])
+
+		# If not clonable, initialize sharable attrs, but keep them isolate.
 		else:
+			for key, val in self._shared_attrs(path,gzipped,file_size).items():
+				setattr(self, key, val)
 
-			# Create the shared space for PODs to this disk location
-			self._SHARED_STATE[path] = {
-				'_path': path,
-				'_values': {},
-				'_keys': [],
-				'_index_lookup': {},
-				'_dirty': set(),
-				'_open': open,
-				'_gzipped': gzipped,
-				'_file_size': file_size
-			}
-
-			# Identify with the shared space
-			for key in self._SHARED_STATE[path]:
-				setattr(self, key, self._SHARED_STATE[path][key])
+		# If we didn't clone an existing clone (maybe because there wasn't one)
+		# do a fresh read from file and register to sync at process exit
+		if not clone_already_exists:
 
 			# Load values from disk into memory.
 			self.revert()
@@ -321,16 +337,17 @@ class PersistentOrderedDict(object):
 			path =  self._path_from_int(file_num)
 			f = self._open(path, 'w')
 
-			# Go through keys mapped to this file and re-write them
+			# Get the keys that belong in this file
 			start = file_num * self._file_size
 			stop = start + self._file_size
-			for key in self._keys[start:stop]:
+			relevant_keys = self._keys[start:stop]
 
-				value = self._values[key]
-				# Escape tabs in key, and encode using utf8
-				serialized_key = self._serialize_key(key)
-				serialized_value = self._serialize_value(value)
-				f.write('%s\t%s\n' % (serialized_key, serialized_value))
+			# Serialize the data and write the file
+			serializer = tastypy.JSONSerializer.dump_items(
+				(k, self._values[k]) for k in relevant_keys
+			)
+			for line in serializer:
+				f.write(line)
 
 		# No more dirty keys
 		self._dirty.clear()
@@ -357,36 +374,14 @@ class PersistentOrderedDict(object):
 		"""
 		Load values from disk into memory, discarding any unsynchronized changes.
 		"""
+		# Clear core data
+		self._keys[:] = []
+		self._index_lookup.clear()
+		self._values.clear()
+		self._dirty.clear()
 
 		# read in all data (if any)
 		self._read()
-
-		# Keep track of files whose contents don't match values in memory
-		self._dirty.clear()
-
-
-	#def copy(self, path, file_size, gzipped=False):
-	#	"""
-	#	Synchronize the POD to a new location on disk specified by ``path``.  
-	#	Future synchronization will also take place at this new location.  
-	#	The old location on disk will be left as-is and will no longer be 
-	#	synchronized.  When synchronizing store ``file_size`` number of
-	#	values per file, and keep files gzipped if ``gzipped`` is ``True``.
-	#	This is not affected by ``hold()``.
-	#	"""
-
-	#	self.gzipped = gzipped
-	#	self._path = path
-	#	self._file_size = file_size
-
-	#	self._set_write_method(gzipped)
-	#	self._ensure_path(path)
-
-	#	num_files = int(math.ceil(
-	#		len(self._values) / float(self._file_size)
-	#	))
-	#	self._dirty_files = set(range(num_files))
-	#	self.sync()
 
 
 	def _ensure_path(self, path):
@@ -412,108 +407,56 @@ class PersistentOrderedDict(object):
 
 
 	def _read(self):
-		# Read persisted data from disk.  This is when the POD is initialized.
-		self._keys[:] = []
-		self._index_lookup.clear()
-		self._values.clear()
 
-		for i, fname in enumerate(
-			tastypy.ls(self._path, dirs=False, absolute=True
-		)):
+		# Read each file found in path that matches the naming format
+		naming_format = '\d+\.json.gz' if self._gzipped else '\d+\.json'
+		file_iterator = tastypy.ls(
+			self._path, dirs=False, absolute=True, match=naming_format)
+		for i, file_path in enumerate(file_iterator):
 
-			# ensure that files are in expected order,
-			# that none are missing, and that no lines are missing.
-			if fname != self._path_from_int(i):
+			# Detect gaps in numbering of file names (indicates missing file)
+			if file_path != self._path_from_int(i):
 				raise tastypy.PersistentOrderedDictIntegrityError(
-					'Expected %s but found %s.' 
-					% (self._path_from_int(i), fname)
+					'Expected %s but found %s.  File missing?' 
+					% (self._path_from_int(i), file_path)
 				)
 
-			if i > 0:
-				prev_file_path = self._path_from_int(i-1)
-				num_lines_prev_file = len(
-					self._open(prev_file_path, 'r').readlines()
+			# Check if the previous file (if any) had the right number of lines
+			if i > 0 and prev_num_entries != self._file_size: 
+				raise tastypy.PersistentOrderedDictIntegrityError(
+					"The file %s appears to be corrupted, because it has "
+					"%d lines (instead of %d)." 
+					% (prev_file_path, prev_num_entries, self._file_size)
 				)
-				if num_lines_prev_file != self._file_size:
-					raise tastypy.PersistentOrderedDictIntegrityError(
-						"PersistentOrderedDict: "
-						"A file on disk appears to be corrupted, because "
-						"it has the wrong number of lines: %s " % prev_file_path
-					)
 
-			for entry in self._open(os.path.join(fname)):
+			# Read all the data from this file.  Record number of entries, to 
+			# be verified if this isn't the last file.
+			prev_file_path = file_path
+			prev_num_entries = 0
+			try:
+				deserialized = tastypy.JSONSerializer.read_items(
+					self._open(file_path))
+				for key, value in deserialized:
+					prev_num_entries += 1
 
-				# skip blank lines (there's always one at end of file)
-				if entry=='':
-					continue
+					# Allow subclasses to intercept and re-interpret lines
+					key, value = self._read_intercept(key, value)
 
-				# remove the newline of the end of serialized_value, and read it
-				try:
-					serialized_key, serialized_value = entry.split('\t', 1)
-					key = self._deserialize_key(serialized_key)
-					value = self._deserialize_value(serialized_value[:-1])
+					# Register the data
+					self._values[key] = value
+					self._keys.append(key)
+					self._index_lookup[key] = len(self._keys)-1
 
-				except ValueError:
-					raise tastypy.PersistentOrderedDictIntegrityError(
-						'PersistentOrderedDict: A file on disk appears to be '
-						'corrupted, because it has malformed JSON: %s' 
-						% self._path_from_int(i)
- 
-					)
-
-				# This is a hook for subclasses to intercept and re-interpret
-				# loaded data without fully re-implementing ``_read()``.
-				key, value = self._read_intercept(key, value)
-
-				self._values[key] = value
-				self._keys.append(key)
-				self._index_lookup[key] = len(self._keys)-1
-
-
-	def _serialize_key(self, key, recursed=False):
-
-		# Recursively ensure that strings are encoded
-		if isinstance(key, tuple):
-			temp_key = []
-			for item in key:
-				temp_key.append(self._serialize_key(item, recursed=True))
-			key = tuple(temp_key)
-
-		# Base call for recursion
-		elif isinstance(key, basestring):
-			key = key.encode('utf8')
-
-		# Do the actual serialization in the root call
-		if not recursed:
-			key = json.dumps(key)
-			key = self._ESCAPE_SLASH_PATTERN.sub(r'\\\\', key)
-			key = self._ESCAPE_TAB_PATTERN.sub(r'\\t', key)
-
-		return key
-
-
-	def _deserialize_key(self, serialized_key):
-		key = self._UNESCAPE_TAB_PATTERN.sub('\g<prefix>\t', serialized_key)
-		key = self._UNESCAPE_SLASH_PATTERN.sub(r'\\', key)
-		key = json.loads(key)
-		key = tuplify_lists(key)
-		return key
-
-
-	def _serialize_value(self, value):
-		return json.dumps(value)
-
-
-	def _deserialize_value(self, serialized_value):
-		return json.loads(serialized_value)
-
+			# Contextualize parsing errors (can be due to bad JSON format)
+			except ValueError as error:
+				raise tastypy.PersistentOrderedDictIntegrityError(
+					'PersistentOrderedDict: The file %s disk appears to be '
+					'corrupted:\n%s' 
+					% (self._path_from_int(i), str(error))
+				)
 
 	def _read_intercept(self, key, val):
 		return key, val
-
-
-	#def __del__(self):
-	#	self.sync()
 
 
 	def _maybe_sync(self, preemptive=0):

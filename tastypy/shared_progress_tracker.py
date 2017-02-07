@@ -11,6 +11,7 @@ about synchronization.
 # TODO: add the init constructor argument
 
 from functools import wraps
+from contextlib import contextmanager
 import sys
 import multiprocessing
 import tastypy
@@ -25,14 +26,9 @@ def _requires_lock(lock):
 	def decorator(f):
 		@wraps(f)
 		def f_with_lock(*args, **kwargs):
-			lock.acquire()
-			try:
+			with lock:
 				return_val = f(*args, **kwargs)
-			except Exception as e:
-				lock.release()
-				raise
-			lock.release()
-			return return_val
+				return return_val
 
 		return f_with_lock
 	return decorator
@@ -72,6 +68,7 @@ def serve_datastructure(datastructure_builder, pipe):
 		if message == SharedProgressTracker.CLOSE:
 			is_open = False
 			datastructure.sync()
+			pipe.send('closed')
 
 		# Handle remote function calls on the progress tracker
 		else:
@@ -115,8 +112,8 @@ def serve_datastructure(datastructure_builder, pipe):
 class SharedPersistentOrderedDict(object):
 	"""
 	A multiprocessing-safe proxy for ``tasatypy.POD``.  Data will be
-	syncronized to disk in files under ``path``.  The SharedPOD supports the
-	same iteration methods as ``POD``, multiple processes can iterate
+	syncronized to disk in files under ``path``.  The ``SharedPOD`` supports the
+	same iteration methods as ``POD``; multiple processes can iterate
 	concurrently without blocking eachother.  All iteration methods return keys
 	and or values in the order in which keys were added.
 	"""
@@ -129,14 +126,17 @@ class SharedPersistentOrderedDict(object):
 	}
 	SERVER_DATASTRUCTURE = tastypy.PersistentOrderedDict
 
-	def __init__(self, *args):
+	def __init__(self, *args, **kwargs):
 
 		self.client_pipe, server_pipe = multiprocessing.Pipe()
 
 		# create / start the underlying POD server
 		server_tracker = multiprocessing.Process(
 			target=serve_datastructure,
-			args=(lambda: self.SERVER_DATASTRUCTURE(*args), server_pipe)
+			args=(
+				lambda: self.SERVER_DATASTRUCTURE(*args, clone=False, **kwargs),
+				server_pipe
+			)
 		)
 		server_tracker.daemon = True	# Shut down server if main process exits
 		server_tracker.start()
@@ -150,11 +150,14 @@ class SharedPersistentOrderedDict(object):
 	def close(self):
 		"""
 		Ask the the underlying ``POD`` server to terminate (it will synchronize
-		to disk first).  Not generally necessary because the server process
-		will sync and shutdown automatically when its parent process
+		to disk first).  Normally you don't need to use this because the server
+		process will sync and shutdown automatically when its parent process
 		terminates.
 		"""
 		self.client_pipe.send(self.CLOSE)
+		# Wait for confirmation that the close signal was received and that the
+		# data structure did it's final synchronization
+		self.client_pipe.recv()
 
 
 	@_requires_tracker_open
@@ -164,6 +167,32 @@ class SharedPersistentOrderedDict(object):
 		All other processes are blocked until ``unlock`` is called.
 		"""
 		self.LOCK.acquire()
+
+
+	@contextmanager
+	@_requires_tracker_open
+	def locked(self):
+		"""
+		Context manager under which only the calling process can interact with
+		the ``SharedPOD``, all other processes being blocked until the context
+		is closed.  Using this context manager is preferable to calling
+		``lock()`` followed by ``unlock()`` because the lock will be released
+		even if an exception is thrown or a return statement reached.  
+
+		Usage:
+
+		.. code-block:: python
+
+			with pod.locked():
+				pod.set['some-key'] += 1
+
+		See `Avoiding raciness`_ to see when you need to use this.
+		"""
+		self.lock()
+		try:
+			yield
+		finally:
+			self.unlock()
 
 
 	@_requires_tracker_open
@@ -295,7 +324,7 @@ class SharedPersistentOrderedDict(object):
 		Return a list of values in the order in which the corresponding keys
 		were added.
 		"""
-		return [val for key, val in self.iteritems(True)]
+		return [val for key, val in self._iter(True)]
 
 	# Magic methods need to be manually forwarded because __getattr__ does not
 	# get called for magic methods.
@@ -313,9 +342,9 @@ class SharedPersistentOrderedDict(object):
 class SharedProgressTracker(SharedPersistentOrderedDict):
 	"""
 	A multiprocessing-safe progress tracker that can be shared by many
-	processes.  Like a ``POD``, but meant for tracking tasks---each value is a
-	dict representing whether the corresponding task has been done and how many
-	times it has been tried.
+	processes.  Like a ``SharedPOD``, but meant for tracking tasks---each value
+	is a dict representing whether the corresponding task has been done and how
+	many times it has been tried.
 	
 	Data is syncronized to disk in files under ``path``.  Specify the maximum
 	number of times a task should be tried using ``max_tries``, which
@@ -325,7 +354,8 @@ class SharedProgressTracker(SharedPersistentOrderedDict):
 	Provide initial data to initialize (or update) the mapping using the
 	``init`` parameter.  The argument should be an iterable of key-value tuples
 	or should implement ``iteritems()`` yielding such an iterable.  This is
-	equivalent to calling ``update(init_arg)`` after creating the ``POD``.	
+	equivalent to calling ``update(init_arg)`` after creating the
+	``SharedTracker``.	
 
 	The JSON-formatted persistence files are gzipped if ``gzipped`` is
 	``True``.    Each file stores a number of values given by ``file_size``.
@@ -338,13 +368,100 @@ class SharedProgressTracker(SharedPersistentOrderedDict):
 	CLOSE = 0
 	LOCK = multiprocessing.RLock()
 	PASS_THROUGHS = SharedPersistentOrderedDict.PASS_THROUGHS | {
-		'check_or_add', 'check', 'add', 'increment_tries', 'decrement_tries',
-		'reset_tries', 'tries', 'mark_done', 'mark_not_done', 'add_if_absent',
-		'num_done', 'num_tried', 'fraction_done', 'fraction_tried',
-		'percent_done', 'percent_tried', 'percent_not_tried',
-		'percent_not_done', 'percent'
+		
+		'increment_tries', 'decrement_tries', 'reset_tries', 'tries', 
+
+		'done', 'mark_done', 'mark_not_done', 
+
+		'add', 	'check_or_add', 'add_if_absent', 'add_many', 
+			'add_many_if_absent',
+
+		'abort', 'unabort', 'aborted'
+
+		'num_tried', 'fraction_tried','percent_tried', 'percent_not_tried',
+		'num_done', 'fraction_done', 'percent_done', 'percent_not_done', 
+		'num_aborted', 'fraction_aborted', 'percent_aborted', 
+			'percent_not_aborted', 
+		'percent', 
 	}
 	SERVER_DATASTRUCTURE = tastypy.ProgressTracker
+
+
+	# TODO: it would be good to find a way to properly delegate the filtering
+	# of done keys to the server, since that transmits less data between
+	# processes and means less code duplication.
+	def todo_items(self, allow_aborted=False):
+		"""
+		Provide an iterator of key-value tuples for keys not yet marked done and 
+		with fewer than max_tries.
+		"""
+		for key, val in self._iter(True):
+			worth_trying = (
+				not val['_done']
+				and (self.max_tries < 1 or val['_tries'] < self.max_tries)
+				and (allow_aborted or not val['_aborted'])
+			)
+			if worth_trying:
+				yield key, val
+
+	# TODO: it would be good to find a way to properly delegate the filtering
+	# of done keys to the server, since that transmits less data between
+	# processes and means less code duplication.
+	def todo_keys(self, allow_aborted=False):
+		"""
+		Provide an iterator over keys not yet marked done and with fewer tries
+		than max_tries.
+		"""
+		for key, val in self.todo_items(allow_aborted):
+			yield key, val
+
+	# TODO: it would be good to find a way to properly delegate the filtering
+	# of done keys to the server, since that transmits less data between
+	# processes and means less code duplication.
+	def todo_values(self, allow_aborted=False):
+		"""
+		Provide an iterator over values corresponding to keys not yet marked 
+		done and with fewer than max_tries.
+		"""
+		for key, val in self.todo_items(allow_aborted):
+			yield val
+
+	# TODO: it would be good to find a way to properly delegate the filtering
+	# of done keys to the server, since that transmits less data between
+	# processes and means less code duplication.
+	def try_items(self, allow_aborted=False):
+		"""
+		Provide an iterator over key-value tuples for keys not yet marked done
+		and with fewer tries than max_tries. Increment the number of tries for
+		each item yielded.
+		"""
+		for key, val in self.todo_items(allow_aborted):
+			self.increment_tries(key)
+			yield key, val
+
+
+	# TODO: it would be good to find a way to properly delegate the filtering
+	# of done keys to the server, since that transmits less data between
+	# processes and means less code duplication.
+	def try_keys(self, allow_aborted=False):
+		"""
+		Provide an iterator over keys not yet marked done and with fewer tries
+		than max_tries.  Increment the number of tries for each key yielded.
+		"""
+		for key, val in self.try_items(allow_aborted):
+			yield key
+
+
+	# TODO: it would be good to find a way to properly delegate the filtering
+	# of done keys to the server, since that transmits less data between
+	# processes and means less code duplication.
+	def try_values(self, allow_aborted=False):
+		"""
+		Provide an iterator over keys not yet marked done and with fewer tries
+		than max_tries.  Increment the number of tries for each value yielded.
+		"""
+		for key, val in self.try_items(allow_aborted):
+			yield val
 
 
 # Give shorter aliases

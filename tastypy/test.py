@@ -1,5 +1,7 @@
 from unittest import main, TestCase
 
+import gzip
+import sys
 import os
 import time
 import random
@@ -7,24 +9,44 @@ import shutil
 import tastypy
 import multiprocessing
 
+# TODO: test gates.
+# TODO: test that max_tries=0 has the expected effects
+# TODO: test that allow_aborted has the expected effects
+# TODO: test SharedTracker special iterations
+# TODO: test ProgressTracker aborted()
+# TODO: There was a bug with PODs and Trackers in which they would be borg'd to
+# 	eachother causing bad initializatin (missing attrubutes like _num_done in
+# 	Tracker).  This was seen from interactions *between tests* but there should
+# 	be a specific test for that
+# asynchronous.  Add test
+# TODO: is clone being respected in tracker?
 # TODO: test that key access can trigger sync'ing and that it the accessed key
 # remains dirty afterward
 # TODO: test that int and tuple-typed keys work
 
+TEST_PATH = 'test-data'
+DEFAULT_TRACKER_ITEM = {'_tries':0, '_done':False}
 
 def remove_if_exists(path):
 	if os.path.exists(path):
 		shutil.rmtree(path)
 
+def read_test_files(gzipped=False):
+	entries = {}
+	_open = gzip.open if gzipped else open
+	for path in tastypy.ls(TEST_PATH):
+		try:
+			f = _open(path)
+			entries.update(tastypy.JSONSerializer.read_items(f))
+		except IOError:
+			raise
+			pass
+	return entries
+
 
 class TestPOD(TestCase):
 
-	TEST_PATH = 'test.pod'
-
-	def tearDown(self):
-		remove_if_exists(self.TEST_PATH)
-
-	def test_basic(self):
+	def basic_test(self, gzipped):
 		"""
 		Create a POD, check that it's files are written in the specified with
 		the correct number of lines per file, and that data persists through a
@@ -33,23 +55,29 @@ class TestPOD(TestCase):
 
 		# Test that data is stored correctly, and persisted after the POD
 		# object is deleted in this namespace
-		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy._POD(self.TEST_PATH)
-		my_pod.hold()
+		remove_if_exists(TEST_PATH)
+		my_pod = tastypy.POD(TEST_PATH, gzipped=gzipped, clone=False)
 		my_pod['a'] = 1
 		my_pod['b'] = '2'
 		my_pod['c'] = {'key':[1,'2']}
-		for i in range(tastypy.DEFAULT_LINES_PER_FILE):
+		for i in range(tastypy.DEFAULT_FILE_SIZE):
 			my_pod[str(i)] = i
-		my_pod.sync()
 
 		# Open a POD to same location, and check tha all data is there
-		other_pod = tastypy._POD(self.TEST_PATH)
-		self.assertEqual(other_pod['a'], 1)
-		self.assertEqual(other_pod['b'], '2')
-		self.assertEqual(other_pod['c'], {'key': [1, '2']})
-		vals = [other_pod[str(i)] for i in range(tastypy.DEFAULT_LINES_PER_FILE)]
-		self.assertEqual(vals, range(tastypy.DEFAULT_LINES_PER_FILE))
+		target_fname = '0.json.gz' if gzipped else '0.json'
+		entries = read_test_files(gzipped)
+
+		self.assertEqual(entries['a'], 1)
+		self.assertEqual(entries['b'], '2')
+		self.assertEqual(entries['c'], {'key': [1, '2']})
+		self.assertEqual(len(entries), tastypy.DEFAULT_FILE_SIZE)
+
+	def test_basic(self):
+		"""
+		Run the basic test first for plain .json files, then for gzipped.
+		"""
+		self.basic_test(False)
+		self.basic_test(True)
 
 
 	def test_integrity_check(self):
@@ -59,28 +87,25 @@ class TestPOD(TestCase):
 		"""
 
 		# Make a POD
-		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy._POD(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		my_pod = tastypy.POD(TEST_PATH)
 		my_pod.hold()
-		for i in range(2 * tastypy.DEFAULT_LINES_PER_FILE):
+		for i in range(2 * tastypy.DEFAULT_FILE_SIZE):
 			my_pod[str(i)] = 'yo'
 		my_pod.sync()
 
 		# Add an extra validly formatted value on the end of the file.
-		# (This should cause an error in a moment because the number of values 
-		# per file is strictly limited so that the correct files are overrwitten 
-		# during syncing).
-		open(my_pod._path_from_int(0), 'a').write('extra-key\t"extra-val"\n')
+		open(my_pod._path_from_int(0), 'a').write('"extra-key"\t"extra-val"\n')
 
-		# Check that an integrity error gets raised.
+		# Check that an integrity error gets raised (due to too many entries)
 		with self.assertRaises(tastypy.PersistentOrderedDictIntegrityError):
 			my_pod.revert()
 
 		# Remove old POD's files and make a new POD
-		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy._POD(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		my_pod = tastypy.POD(TEST_PATH)
 		my_pod.hold()
-		for i in range(2 * tastypy.DEFAULT_LINES_PER_FILE):
+		for i in range(2 * tastypy.DEFAULT_FILE_SIZE):
 			my_pod[str(i)] = i
 		my_pod.sync()
 
@@ -91,10 +116,10 @@ class TestPOD(TestCase):
 
 		# Check that an integrity error gets raised
 		with self.assertRaises(tastypy.PersistentOrderedDictIntegrityError):
-			my_pod = tastypy._POD(self.TEST_PATH)
+			my_pod.revert()
 
 
-	def test_synchronization_control(self):
+	def test_auto_sync(self):
 		"""
 		Test that synchronization can be suspended and reactivated, that
 		synchronization can be forced manually, and that specific items can be
@@ -102,55 +127,66 @@ class TestPOD(TestCase):
 		"""
 
 		# Clear previous data files if any
-		remove_if_exists(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
 
-		# By default, data is not sync'd immediately
-		my_pod = tastypy._POD(self.TEST_PATH)
+		# Make a new POD, and add one value
+		my_pod = tastypy.POD(TEST_PATH, clone=False)
 		my_pod['a'] = 1
 
-		other_pod = tastypy._POD(self.TEST_PATH)
+		# That value isn't synced to disk yet
+		entries = read_test_files()
 		with self.assertRaises(KeyError):
-			self.assertEqual(other_pod['a'], 1)
+			entries['a']
 
 		# Data is synced when the buffer reaches a certain size
-		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+		for i in range(tastypy.DEFAULT_SYNC_AT):
 			my_pod[str(i)] = i
-		other_pod = tastypy._POD(self.TEST_PATH)
-		self.assertEqual(other_pod['a'], 1)
+		entries = read_test_files()
+		self.assertEqual(entries['a'], 1)
 
-		# When a hold is applied, data is no longer sync'd
+
+	def test_hold(self):
+
+		# Clear previous data files if any
+		remove_if_exists(TEST_PATH)
+
+		# Make a new POD, and add one value
+		my_pod = tastypy.POD(TEST_PATH, clone=False)
+		my_pod['a'] = 1
+
+		# When a hold is applied, data isn't sync'd even if we add many values
 		my_pod.hold()
-		my_pod['b'] = 2
-		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+		for i in range(tastypy.DEFAULT_SYNC_AT):
 			my_pod[str(i)] = i
-		my_other_pod = tastypy._POD(self.TEST_PATH)
+		entries = read_test_files()
 		with self.assertRaises(KeyError):
-			my_other_pod['b']
+			entries['a']
 
-		# Calling sync() does synchronize out-of-sync data
+		# Manually calling sync() does synchronize out-of-sync data
 		my_pod.sync()
-		my_other_pod = tastypy._POD(self.TEST_PATH)
-		self.assertTrue(my_other_pod['b'], 2)
+		entries = read_test_files()
+		self.assertTrue(entries['a'], 1)
 
 		# But automatic synchronization is still disabled
-		my_pod['c'] = 3
-		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+		my_pod['b'] = 2
+		for i in range(tastypy.DEFAULT_SYNC_AT):
 			my_pod[str(i)] = i
-		my_other_pod = tastypy._POD(self.TEST_PATH)
+		entries = read_test_files()
 		with self.assertRaises(KeyError):
-			my_other_pod['c']
+			entries['b']
 
-		# Calling unhold() also synchronizes out-of-sync data
+		# Calling unhold() synchronizes out-of-sync data if it's beyond the
+		# sync_at threshold
 		my_pod.unhold()
-		my_other_pod = tastypy._POD(self.TEST_PATH)
-		self.assertEqual(my_other_pod['c'], 3)
+		entries = read_test_files()
+		self.assertEqual(entries['b'], 2)
 
 		# And it also re-enables automatic synchronization
-		my_pod['d'] = 4
-		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+		my_pod['c'] = 3
+		for i in range(tastypy.DEFAULT_SYNC_AT):
 			my_pod[str(i)] = i
-		my_other_pod = tastypy._POD(self.TEST_PATH)
-		self.assertEqual(my_other_pod['d'], 4)
+		entries = read_test_files()
+		self.assertEqual(entries['c'], 3)
 
 
 	def test_iteration(self):
@@ -161,10 +197,10 @@ class TestPOD(TestCase):
 		num_lines = 20
 
 		# Clear previous data files if any
-		remove_if_exists(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
 
 		# Test various iteration functions
-		my_pod = tastypy._POD(self.TEST_PATH)
+		my_pod = tastypy.POD(TEST_PATH, clone=False)
 		my_pod.hold()
 		for i in range(num_lines):
 			my_pod[str(i)] = i
@@ -211,37 +247,31 @@ class TestPOD(TestCase):
 		Test that PODs their length and what keys are "in" them.
 		"""
 		# Clear previous data files if any
-		remove_if_exists(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
 
 		# Test that my_pod knows what keys it has
-		my_pod = tastypy._POD(self.TEST_PATH)
+		my_pod = tastypy.POD(TEST_PATH, clone=False)
 		my_pod['a'] = 1
 		self.assertTrue('a' in my_pod)
 		self.assertFalse('b' in my_pod)
 
 
 
-
 class TestTracker(TestCase):
 
-	TEST_PATH = 'test.tracker'
-
-	def tearDown(self):
-		remove_if_exists(self.TEST_PATH)
-
 	def test_add(self):
-		remove_if_exists(self.TEST_PATH)
-		my_tracker = tastypy._Tracker(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		my_tracker = tastypy.Tracker(TEST_PATH, clone=False)
 
 		# Check that addition insets the expected value
 		my_tracker.add('a')
-		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+		for i in range(tastypy.DEFAULT_SYNC_AT):
 			my_tracker.add(str(i))
 		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':False})
 
 		# Verify persistence
-		new_tracker = tastypy._Tracker(self.TEST_PATH)
-		self.assertEqual(new_tracker['a'], {'_tries':0, '_done':False})
+		entries = read_test_files()
+		self.assertEqual(entries['a'], {'_tries':0, '_done':False})
 
 		# Verify that DuplicateKeyError is raised if we try adding the same
 		# key twice
@@ -279,19 +309,14 @@ class TestTracker(TestCase):
 		self.assertEqual(my_tracker['b'], {'_tries':0, '_done':False})
 
 		# Test incrementing tries
-		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':True})
 		self.assertEqual(my_tracker.tries('a'), 0)
 		my_tracker.increment_tries('a')
-		self.assertEqual(my_tracker['a'], {'_tries':1, '_done':True})
 		self.assertEqual(my_tracker.tries('a'), 1)
 		my_tracker.increment_tries('a')
-		self.assertEqual(my_tracker['a'], {'_tries':2, '_done':True})
 		self.assertEqual(my_tracker.tries('a'), 2)
 		my_tracker.decrement_tries('a')
-		self.assertEqual(my_tracker['a'], {'_tries':1, '_done':True})
 		self.assertEqual(my_tracker.tries('a'), 1)
 		my_tracker.reset_tries('a')
-		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':True})
 		self.assertEqual(my_tracker.tries('a'), 0)
 
 		# Test setting a sub-key
@@ -299,15 +324,52 @@ class TestTracker(TestCase):
 		self.assertEqual(my_tracker['a'], {'b':'c', '_tries':0, '_done':True})
 
 		# Test that a sub-key will be synchronized
-		for i in range(tastypy.DEFAULT_ACCEPTABLE_DISSONANCE):
+		for i in range(tastypy.DEFAULT_SYNC_AT):
 			my_tracker.reset_tries(str(i))
-		other_tracker = tastypy._Tracker(self.TEST_PATH)
-		self.assertEqual(other_tracker['a'], {'b':'c', '_tries':0, '_done':True})
+		entries = read_test_files()
+		self.assertEqual(entries['a'], {'b':'c', '_tries':0, '_done':True})
+
+
+	def test_update(self):
+		# Test tries status
+		remove_if_exists(TEST_PATH)
+		my_tracker = tastypy.Tracker(TEST_PATH, clone=False)
+
+		my_tracker.add('a')
+		my_tracker['a']['foo'] = 1
+		my_tracker.update(
+			{
+				'a': {'foo': 2, 'bar': [3], 'beep': 'x'},
+				'b': {'_tries':1, 'fizz': 'baz'}
+			}, 
+			(('a', {'beep':'xx', 'boo':42}),),
+			c={'bam':[89]}
+		)
+
+		my_tracker.sync()
+		entries = read_test_files()
+		self.assertEqual(
+			entries['a'],
+			{
+				'_tries':0, '_aborted':False, '_done':False, 
+				'foo':2, 'bar':[3], 'beep':'xx', 'boo':42
+			}
+		)
+		self.assertEqual(
+			entries['b'],
+			{'_tries':1, '_aborted':False, '_done':False, 'fizz':'baz'}
+		)
+		self.assertEqual(
+			entries['c'], 
+			{'_tries':0, '_aborted':False, '_done':False, 'bam':[89]}
+		)
+
 
 	def test_done_tried(self):
 
 		# Test tries status
-		my_tracker = tastypy._Tracker(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		my_tracker = tastypy.Tracker(TEST_PATH, clone=False)
 		my_tracker.add('a')
 		my_tracker.add('b')
 
@@ -321,99 +383,104 @@ class TestTracker(TestCase):
 		my_tracker.increment_tries('a')
 		self.assertEqual(my_tracker.num_tried(), 2)
 		my_tracker.sync()
-		new_tracker = tastypy._Tracker(self.TEST_PATH)
-		self.assertEqual(new_tracker.num_tried(), 2)
-		self.assertEqual(new_tracker.fraction_tried(), 1.0)
-		self.assertEqual(new_tracker.percent_tried(), '100.00 %')
-		new_tracker.reset_tries('b')
-		self.assertEqual(new_tracker.fraction_tried(), 0.5)
-		self.assertEqual(new_tracker.percent_tried(), '50.00 %')
+
+		self.assertEqual(my_tracker.num_tried(), 2)
+		self.assertEqual(my_tracker.fraction_tried(), 1.0)
+		self.assertEqual(my_tracker.percent_tried(), '100.00 %')
+		my_tracker.reset_tries('b')
+		self.assertEqual(my_tracker.fraction_tried(), 0.5)
+		self.assertEqual(my_tracker.percent_tried(), '50.00 %')
 
 		# Test progress status
-		self.assertEqual(new_tracker.num_done(), 0)
-		self.assertEqual(new_tracker.fraction_done(), 0.0)
-		self.assertEqual(new_tracker.percent_done(), '0.00 %')
-		new_tracker.mark_done('a')
-		self.assertEqual(new_tracker.num_done(), 1)
-		self.assertEqual(new_tracker.fraction_done(), 0.5)
-		self.assertEqual(new_tracker.percent_done(), '50.00 %')
-		new_tracker.mark_done('b')
-		self.assertEqual(new_tracker.num_done(), 2)
-		self.assertEqual(new_tracker.fraction_done(), 1.0)
-		self.assertEqual(new_tracker.percent_done(), '100.00 %')
+		self.assertEqual(my_tracker.num_done(), 0)
+		self.assertEqual(my_tracker.fraction_done(), 0.0)
+		self.assertEqual(my_tracker.percent_done(), '0.00 %')
+		my_tracker.mark_done('a')
+		self.assertEqual(my_tracker.num_done(), 1)
+		self.assertEqual(my_tracker.fraction_done(), 0.5)
+		self.assertEqual(my_tracker.percent_done(), '50.00 %')
+		my_tracker.mark_done('b')
+		self.assertEqual(my_tracker.num_done(), 2)
+		self.assertEqual(my_tracker.fraction_done(), 1.0)
+		self.assertEqual(my_tracker.percent_done(), '100.00 %')
 
 
 
 class TestSharedPOD(TestCase):
 
-	TEST_PATH = 'test.pod'
-
-	def tearDown(self):
-		remove_if_exists(self.TEST_PATH)
-
 	# TODO: test that in-memory values are still shared between processes when
 	# hold is active, but that all processes except caller are blocked when
 	# lock is called.
 	def test_basic_functions(self):
-		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		my_pod['a'] = 1
+
+		remove_if_exists(TEST_PATH)
+
+		# Shared PODs should sync when they close
+		my_pod = tastypy.SharedPersistentOrderedDict(TEST_PATH)
+		my_pod.set['a'] = 1
 		my_pod.close()
+		entries = read_test_files()
+		self.assertEqual(entries['a'], 1)
 
-		my_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		self.assertEqual(my_pod['a'], 1)
-		self.assertTrue('a' in my_pod)
-		self.assertFalse('b' in my_pod)
-
+		# SharedPODs don't sync automatically when hold is called
+		my_pod = tastypy.SharedPersistentOrderedDict(TEST_PATH)
 		my_pod.hold()
-		my_pod['c'] = {'key':1}
-		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		self.assertTrue('c' in my_pod)
-		self.assertFalse('c' in other_pod)
-		self.assertRaises(KeyError, lambda: other_pod['c'])
-		with self.assertRaises(KeyError):
-			other_pod['c']
+		my_pod.set['b'] = 2
+		for i in range(tastypy.DEFAULT_SYNC_AT):
+			my_pod.set[i] = i
+		entries = read_test_files()
+		self.assertFalse('b' in entries)
+
+		# The SharedPOD sycs when unhold is called (it has more than sync_at
+		# dirty values)
 		my_pod.unhold()
+		entries = read_test_files()
+		self.assertEqual(entries['b'], 2)
 
-		other_pod.close()
-		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		self.assertTrue('c' in other_pod)
-		self.assertEqual(other_pod['c'], {'key':1})
-
-		my_pod.hold()
-		my_pod['d'] = 1
-		my_pod.maybe_sync()
-		other_pod.close()
-		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		self.assertFalse('d' in other_pod)
-		my_pod.sync()
-		other_pod.close()
-		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		self.assertTrue('d' in other_pod)
+		# And automatic synchronization has resumed
+		my_pod.set['c'] = 3
+		for i in range(tastypy.DEFAULT_SYNC_AT):
+			my_pod.set[i] = i
+		entries = read_test_files()
+		self.assertEqual(entries['c'], 3)
 
 
 	def test_deep_assignment(self):
 
-		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		my_pod['a'] = {'key': 1}
+		remove_if_exists(TEST_PATH)
+		my_pod = tastypy.SharedPersistentOrderedDict(TEST_PATH)
+		my_pod['a'] = {'int': 1, 'list':[], 'dict':{'a':1}}
 		my_pod.sync()
-		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		self.assertEqual(other_pod['a']['key'], 1)
 
-		my_pod['a', 'key'] = 2
+		# First just check that the value is there
+		entries = read_test_files()
+		self.assertEqual(
+			entries['a'], {'int': 1, 'list':[], 'dict':{'a':1}}
+		)
+
+		# Try different updates
+		my_pod.set['a']['list'].append(2)
+		my_pod.set['a']['dict']['b'] = 4
+		my_pod.set['a']['int'] += 1
 		my_pod.sync()
-		other_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
-		self.assertEqual(other_pod['a']['key'], 2)
-		self.assertEqual(other_pod['a', 'key'], 2)
+		expected = {'int': 2, 'list':[2], 'dict':{'a':1, 'b':4}}
+		entries = read_test_files()
+		self.assertEqual(entries['a'], expected)
 
-		my_pod.close()
-		other_pod.close()
+		# Try different updates
+		del my_pod.set['a']['int']
+		my_pod.set['a']['list'].append(5)
+		my_pod.set['a']['dict'].update({'c':6})
+		my_pod.sync()
+		expected ={'list':[2,5], 'dict':{'a':1, 'b':4, 'c':6}}
+		entries = read_test_files()
+		self.assertEqual(entries['a'], expected)
 
 
 	def test_concurrent_write(self):
-		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		my_pod = tastypy.SharedPersistentOrderedDict(TEST_PATH)
+		my_pod.set['a'] = 0
 
 		p1 = multiprocessing.Process(
 				target=self.concurrent_write, args=(my_pod,'A'))
@@ -426,21 +493,20 @@ class TestSharedPOD(TestCase):
 		p1.join()
 		p2.join()
 
-		self.assertEqual(my_pod['yo'], 400)
-		my_pod.close()
+		self.assertEqual(my_pod['a'], 400)
 
 
 	def test_iteration(self):
 
-		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		my_pod = tastypy.SharedPersistentOrderedDict(TEST_PATH)
 
 		my_pod.hold()
-		for i in range(2 * tastypy.DEFAULT_LINES_PER_FILE):
+		for i in range(2 * tastypy.DEFAULT_FILE_SIZE):
 			my_pod[str(i)] = i
 		my_pod.unhold()
 
-		expected_values = range(2 * tastypy.DEFAULT_LINES_PER_FILE)
+		expected_values = range(2 * tastypy.DEFAULT_FILE_SIZE)
 		expected_keys = [str(i) for i in expected_values]
 		expected_items = zip(expected_keys, expected_values)
 		self.assertEqual(my_pod.values(), expected_values)
@@ -461,8 +527,9 @@ class TestSharedPOD(TestCase):
 
 
 	def test_hold(self):
-		remove_if_exists(self.TEST_PATH)
-		my_pod = tastypy.SharedPersistentOrderedDict(self.TEST_PATH)
+
+		remove_if_exists(TEST_PATH)
+		my_pod = tastypy.SharedPersistentOrderedDict(TEST_PATH)
 
 		# Spawn two processes that each request a hold on the same POD and
 		# insert some data.  The first process will get the hold first, and be
@@ -501,105 +568,98 @@ class TestSharedPOD(TestCase):
 	
 	def concurrent_write(self, my_pod, name):
 		for i in range(200):
-			my_pod.lock()
-			if 'yo' in my_pod:
-				my_pod['yo'] += 1
-			else:
-				my_pod['yo'] = 1
-			my_pod.unlock()
+			with my_pod.locked():
+				my_pod.set['a'] += 1
 
 
 	def do_test_hold(self, my_pod, name):
-		my_pod.holdlock()
-		for i in range(10):
-			time.sleep(random.random()/100.)
-			my_pod['%s:%d' % (name, i)] = time.time()
-		my_pod.unholdlock()
+		with my_pod.locked():
+			for i in range(10):
+				time.sleep(random.random()/100.)
+				my_pod['%s:%d' % (name, i)] = time.time()
 
 
 class TestSharedTracker(TestCase):
 
-	TEST_PATH = 'test.tracker'
-
-
-	def tearDown(self):
-		remove_if_exists(self.TEST_PATH)
-
-
 	def test_basic_function(self):
-		remove_if_exists(self.TEST_PATH)
-		my_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		my_tracker = tastypy.SharedProgressTracker(TEST_PATH)
 
 		# Demonstrate basic persistence
 		my_tracker.add('a')
 		my_tracker.close()
-		my_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
-		self.assertTrue('a' in my_tracker)
-		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':False})
-		self.assertFalse('b' in my_tracker)
+		entries = read_test_files()
+		self.assertTrue(entries['a'], {'_tries':0, '_done':False})
 
 		# Demonstrate hold()
+		remove_if_exists(TEST_PATH)
+		my_tracker = tastypy.SharedProgressTracker(TEST_PATH)
 		my_tracker.hold()
-		my_tracker.maybe_sync()	# It should not sync because hold() was called
-		my_tracker['a', 'key'] = 1
-		other_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
-		self.assertTrue('a' in my_tracker)
-		self.assertTrue('a' in other_tracker)
-		self.assertRaises(KeyError, lambda: other_tracker['a']['key'])
+		my_tracker.add('a')
+		for i in range(tastypy.DEFAULT_SYNC_AT):
+			my_tracker.add(i)
+
+		entries = read_test_files()
+		self.assertFalse('a' in entries)
 
 		# Unhold causes unsync'd values to be sync'd
 		my_tracker.unhold()
-		other_tracker.revert()
-		self.assertTrue('a' in other_tracker)
-		self.assertEqual(other_tracker['a']['key'], 1)
+		entries = read_test_files()
+		self.assertEqual(entries['a'], DEFAULT_TRACKER_ITEM) 
 
 		# Demonstrate increment_tries()
 		my_tracker.increment_tries('a')
 		my_tracker.sync()
-		other_tracker.revert()
-		self.assertEqual(other_tracker.tries('a'), 1)
+		entries = read_test_files()
+		self.assertEqual(entries['a']['_tries'], 1) 
 
 		# Demonstrate decrement_tries()
 		my_tracker.decrement_tries('a')
 		my_tracker.sync()
-		other_tracker.revert()
-		self.assertEqual(other_tracker.tries('a'), 0)
+		entries = read_test_files()
+		self.assertEqual(entries['a']['_tries'], 0) 
 
 		# Demontstrate mark_done() and check()
 		my_tracker.mark_done('a')
 		my_tracker.sync()
-		other_tracker.revert()
-		self.assertTrue(other_tracker.check('a'))
+		entries = read_test_files()
+		self.assertTrue(entries['a']['_done'])
 
 		# Demonstrate mark_not_done() and check()
 		my_tracker.mark_not_done('a')
 		my_tracker.sync()
-		other_tracker.revert()
-		self.assertFalse(other_tracker.check('a'))
+		entries = read_test_files()
+		self.assertFalse(entries['a']['_done'])
+
+
+	def test_fraction(self):
 
 		# Demonstrate num_done and num_tried, and related functions
+		remove_if_exists(TEST_PATH)
+		my_tracker = tastypy.SharedProgressTracker(TEST_PATH)
+
+		my_tracker.add('a')
+		my_tracker.mark_done('a')
 		my_tracker.add('b')
 		my_tracker.mark_done('b')
 		my_tracker.increment_tries('b')
 		my_tracker.add('c')
-		my_tracker.increment_tries('c')
 		my_tracker.sync()
-		other_tracker.revert()
 
-		self.assertEqual(other_tracker.num_done(), 1)
-		self.assertEqual(other_tracker.fraction_done(), 1/3.)
-		self.assertEqual(other_tracker.percent_done(), '%.2f %%' % (100/3.))
+		self.assertEqual(my_tracker.num_done(), 2)
+		self.assertEqual(my_tracker.fraction_done(), 2/3.)
+		self.assertEqual(my_tracker.percent_done(), '%.2f %%' % (200/3.))
 
-		self.assertEqual(other_tracker.num_tried(), 2)
-		self.assertEqual(other_tracker.fraction_tried(), 2/3.)
-		self.assertEqual(other_tracker.percent_tried(), '%.2f %%' % (200/3.))
+		self.assertEqual(my_tracker.num_tried(), 1)
+		self.assertEqual(my_tracker.fraction_tried(), 1/3.)
+		self.assertEqual(my_tracker.percent_tried(), '%.2f %%' % (100/3.))
 
 
 
 	def test_iteration(self):
 
-		remove_if_exists(self.TEST_PATH)
-		my_tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		my_tracker = tastypy.SharedProgressTracker(TEST_PATH)
 
 		my_tracker.hold()
 		for i in range(20):
@@ -626,9 +686,39 @@ class TestSharedTracker(TestCase):
 		my_tracker.close()
 
 
+	def test_special_iteration(self):
+		remove_if_exists(TEST_PATH)
+		tracker = tastypy.SharedProgressTracker(TEST_PATH, max_tries=2)
+
+		tracker.add_many(['a','b','c','d'])
+
+		# A will not be yielded because it's aborted
+		tracker.abort('a')
+
+		# 'b' will be yielded because it has only one try (max_tries=2)
+		tracker.increment_tries('b')
+
+		# 'c' will not be yielded because it has two tries
+		tracker.increment_tries('c')
+		tracker.increment_tries('c')
+
+		# 'd' will not be yielded because it is marked done
+		tracker.mark_done('d')
+
+		items = []
+		for item in tracker.todo_items:
+			items.append(item)
+		self.assertEqual(items, [
+			('b', {'_tries':1, '_done':False, '_aborted':False})
+		])
+
+
+		
+
+
 	def test_concurrent_write(self):
-		remove_if_exists(self.TEST_PATH)
-		tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		tracker = tastypy.SharedProgressTracker(TEST_PATH)
 		tracker.add('yo')
 
 		p1 = multiprocessing.Process(
@@ -647,8 +737,8 @@ class TestSharedTracker(TestCase):
 
 
 	def test_hold(self):
-		remove_if_exists(self.TEST_PATH)
-		tracker = tastypy.SharedProgressTracker(self.TEST_PATH)
+		remove_if_exists(TEST_PATH)
+		tracker = tastypy.SharedProgressTracker(TEST_PATH)
 
 		# Spawn two processes that each request a hold on the same tracker and
 		# insert some data.  The first process will get the hold first, and be
@@ -690,14 +780,14 @@ class TestSharedTracker(TestCase):
 
 
 	def do_test_hold(self, tracker, name):
-		tracker.holdlock()
-		for i in range(10):
-			time.sleep(random.random() / 100.0)
-			key = '%s:%d' % (name, i)
-			tracker.add(key)
-			tracker[key, 'time'] = time.time()
-		tracker.unholdlock()
+		with tracker.locked():
+			for i in range(10):
+				time.sleep(random.random() / 100.0)
+				key = '%s:%d' % (name, i)
+				tracker.add(key)
+				tracker.set[key]['time'] = time.time()
 
 
 if __name__ == '__main__':
 	main()
+

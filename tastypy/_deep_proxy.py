@@ -10,7 +10,7 @@ class DeepProxyMeta(type):
 		# to the method's scope.
 		def arm_call_callback(method_name):
 			def call_callback(self, *args, **kwargs):
-				self.method_callback(
+				return self.method_callback(
 					self.parent_keys, method_name, *args, **kwargs)
 			return call_callback
 
@@ -45,10 +45,13 @@ class DeepProxy(object):
 
 	def default_method_callback(self, key_tuple, method, *args, **kwargs):
 		print key_tuple, '.%s()'%method, args, kwargs
+		return self
 
 	def __getattr__(self, attr):
 		def call_method_callback(*args, **kwargs):
-			self.method_callback(self.parent_keys, attr, *args, **kwargs)
+			return_val = self.method_callback(
+				self.parent_keys, attr, *args, **kwargs)
+			return return_val
 		return call_method_callback
 
 	def __getitem__(self, key):
@@ -59,6 +62,7 @@ class DeepProxy(object):
 		)
 
 	#def __setitem__(self, key, val):
+	#	print key_tuple, '<--', val
 	#	self.setitem_callback(self.parent_keys + (key,), val)
 	
 

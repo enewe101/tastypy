@@ -7,7 +7,11 @@ crash or suspension.
 
 
 import tastypy
-
+DEFAULT_PROGRESS_TRACKER_MAPPING = (
+	('_tries', 0),
+	('_done', False),
+	('_aborted', False)
+)
 
 
 # TODO: override setitem so that new top-level keys can't be added without an
@@ -16,15 +20,15 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 
 	"""
 	A specialized subclass of ``POD`` for tracking tasks, whose values are
-	dicts representing whether the task has been done and how many times it has
-	been tried.  
+	dicts representing whether the task has been done or aborted, and how many 
+	times it has been tried.  
 
 	Transprantly aynchronizes to disk using files stored under ``path``.  
 	Specify the maximum number of times a task should be tried using 
-	``max_tries``, which influences which tasks are tried under certain
-	iteration modes.  If ``max_tries`` is ``0`` no limit is applied.
+	``max_tries``, which influences the behaviour of gates_ and iterators_.
+	If ``max_tries`` is ``0`` no limit is applied.
 
-	Provide initial data to initialize (or update) the mapping using the
+	Optionally provide data to initialize (or update) the mapping using the
 	``init`` parameter.  The argument should be an iterable of key-value tuples
 	or should implement ``iteritems()`` yielding such an iterable.  This is
 	equivalent to calling ``update(init_arg)`` after creating the ``POD``.	
@@ -36,6 +40,8 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 	reaches ``sync_at``, or if the program terminates.
 	"""
 
+	_SHARED_TRACKER_STATE = {}
+
 	def __init__(
 		self, 
 		path,
@@ -44,10 +50,61 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 		gzipped=False,
 		file_size=tastypy.DEFAULT_FILE_SIZE,
 		sync_at=tastypy.DEFAULT_SYNC_AT,
+		clone=True
 	):
 		super(ProgressTracker, self).__init__(
-			path, init, gzipped, file_size, sync_at)
+			path, init, gzipped, file_size, sync_at, clone)
 		self.max_tries = max_tries
+
+
+	# Trackers can share state with one another, but their shared state is
+	# separated from PODs'
+	def _get_shared_state(self):
+		return self._SHARED_TRACKER_STATE
+
+	def _shared_attrs(self, path, gzipped, file_size):
+		attrs = super(ProgressTracker, self)._shared_attrs(
+			path, gzipped, file_size)
+		attrs.update({
+			'_num_done': 0,
+			'_num_tried': 0,
+			'_num_aborted': 0
+		})
+		return attrs
+
+
+	def update(self, *mappings, **kwargs):
+		"""
+		Similar to :py:func:`POD.update <PersistentOrderedDict.update>`, the
+		mappings and keyword arguments should provide key-value pairs, but the
+		values should be ``dict``\ s.  The provided values are used to
+		``dict.update()`` the existing values.  If the key didn't exist,
+		:py:meth:`add(key) <add()>` is called before attempting to mixin the
+		supplied value.  Therefore it is never necessary to provide special
+		keys (``'_done'``, ``'_tries'``, ``'_aborted'``) in update dictionaries
+		unless you actually want to mutate those values.
+		"""
+		for key, val in self._iterate_updates(*mappings, **kwargs):
+			if key not in self._values:
+				self.add(key)
+			self[key].update(val)
+
+
+	def _iterate_updates(self, *mappings, **kwargs):
+		# This is used to simplify the code for ``update()``.  It considers the
+		# various locations that updates can be commingn from and yields them
+		# in a standardized way, respecting the order of precedence for
+		# updates.
+		for mapping in mappings:
+			if hasattr(mapping, 'iteritems'):
+				for key, val in mapping.iteritems():
+					yield key, mapping[key]
+			else:
+				for key, val in mapping:
+					yield key, val
+
+		for key in kwargs:
+			yield key, kwargs[key]
 
 
 	def abort(self, key):
@@ -62,7 +119,7 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 			self._num_aborted += 1
 			self[key]['_aborted'] = True
 			self.mark_dirty(key)
-			self.maybe_sync()
+			self._maybe_sync()
 
 
 	def unabort(self, key):
@@ -77,111 +134,166 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 			self._num_aborted -= 1
 			self[key]['_aborted'] = False
 			self.mark_dirty(key)
-			self.maybe_sync()
+			self._maybe_sync()
 
 
-	def is_aborted(self, key):
+	def aborted(self, key):
+		"""
+		Returns ``True`` if ``key`` was aborted.
+		"""
 		return self._values[key]['_aborted']
 
 
-	def todo_keys(self):
+	def todo_keys(self, allow_aborted=False):
 		"""
-		Provide an iterator over keys not yet marked done and with fewer tries
-		than max_tries.
+		Provides an iterator over keys that are not done, not
+		aborted, and have been tried fewer than ``max_tries`` times.  
+		If ``allow_aborted`` is ``True``, then yield aborted keys that meet the
+		other criteria.
+		Iteration order matches the order in which keys were added.
 		"""
 		for key in self._keys:
 			val = self._values[key]
-			worth_trying = self.max_tries < 1 or val['_tries'] < self.max_tries
-			if not val['_done'] and worth_trying:
+			if self.should_do(key, allow_aborted):
 				yield key
 
-	def todo_items(self):
+	def todo_items(self, allow_aborted=False):
 		"""
-		Provide an iterator of key-value tuples for keys not yet marked done and 
-		with fewer than max_tries.
+		Provides an iterator of key-value tuples for keys that are not done, not
+		aborted, and have been tried fewer than ``max_tries`` times.  
+		If ``allow_aborted`` is ``True``, then yield aborted items that meet the
+		other criteria.
+		Iteration order matches the order in which keys were added.
 		"""
-		for key in self.todo_keys:
+		for key in self.todo_keys(allow_aborted):
 			yield key, self._values[key]
 
-	def todo_values(self):
+	def todo_values(self, allow_aborted=False):
 		"""
-		Provide an iterator over values corresponding to keys not yet marked 
-		done and with fewer than max_tries.
+		Provides an iterator over values corresponding to keys that are not
+		done, not aborted, and have been tried fewer than ``max_tries`` times.
+		If ``allow_aborted`` is ``True``, then yield aborted values that meet the
+		other criteria.
+		Iteration order matches the order in which keys were added.
 		"""
-		for key in self.todo_keys:
+		for key in self.todo_keys(allow_aborted):
 			yield key, self._values[key]
 
-	def try_keys(self):
+	def try_keys(self, allow_aborted=False):
 		"""
-		Provide an iterator over keys not yet marked done and with fewer tries
-		than max_tries.  Increment the number of tries for each key yielded.
+		Provides an iterator over keys that are not
+		done, not aborted, and have been tried fewer than ``max_tries`` times.
+		If ``allow_aborted`` is ``True``, then yield aborted keys that meet the
+		other criteria.
+		Increment the number of tries for each key yielded.
+		Iteration order matches the order in which keys were added.
 		"""
-		for key in self.todo_keys:
+		for key in self.todo_keys(allow_aborted):
 			self.increment_tries(key)
 			yield key
 
-	def try_items(self):
+	def try_items(self, allow_aborted=False):
 		"""
-		Provide an iterator over keys  not yet marked done and with fewer tries
-		than max_tries. Increment the number of tries for each item yielded.
+		Provides an iterator of key-value tuples for keys that are not
+		done, not aborted, and have been tried fewer than ``max_tries`` times.
+		If ``allow_aborted`` is ``True``, then yield aborted items that meet the
+		other criteria.
+		Increment the number of tries for each key yielded.
+		Iteration order matches the order in which keys were added.
 		"""
-		for key in self.try_keys():
+		for key in self.try_keys(allow_aborted):
 			return key, self._values[key]
 
-	def try_values(self):
+	def try_values(self, allow_aborted=False):
 		"""
-		Provide an iterator over keys not yet marked done and with fewer tries
-		than max_tries.  Increment the number of tries for each value yielded.
+		Provides an iterator over values corresponding to keys that are not
+		done, not aborted, and have been tried fewer than ``max_tries`` times.
+		If ``allow_aborted`` is ``True``, then yield aborted values that meet the
+		other criteria.
+		Increment the number of tries for the key corresponding to each value
+		yeilded.
+		Iteration order matches the order in which keys were added.
 		"""
-		for key in self.try_keys():
+		for key in self.try_keys(allow_aborted):
 			return self._values[key]
 
-	def check_or_add(self, key):
+
+	def done(self, key):
 		"""
-		checks if there is an entry for key already marked as done
-		(returns True if so).  If no entry exists for key, it makes one
-		and provides it with a defualt value of _done:False and _tries:0
+		Returns ``True`` if ``key`` is done.  Does not raise ``KeyError`` if
+		key does not exist, just returns ``False``.
 		"""
-		key = self._ensure_unicode(key)
-		if key in self:
-			if self[key]['_done']:
-				return True
-			else:
-				return False
-		else:
-			self[key] = {'_done':False, '_tries':0}
+		try:
+			val = self[key]
+		except KeyError:
 			return False
+		else:
+			return val['_done']
 
 
-	def check(self, key):
+	def should_do(self, key, allow_aborted=False):
 		"""
-		Returns ``True`` if ``key`` is done.
+		Returns ``True`` if ``key`` is not done, not aborted, and not tried
+		more than ``max_tries`` times.  If ``allow_aborted`` is ``True``, then
+		return ``True`` for keys that would otherwise return ``False`` only
+		because they are aborted.
 		"""
-		key = self._ensure_unicode(key)
-		if key in self:
-			if self[key]['_done']:
-				return True
-			else:
-				return False
-		else:
-			return False
+		val = self[key]
+		return (
+			not val['_done']
+			and (self.max_tries < 1 or val['_tries'] < self.max_tries)
+			and (allow_aborted or not val['_aborted'])
+		)
+
+	def should_do_add(self, key, allow_aborted=False):
+		"""
+		Similar to :py:meth:`should_do`, but if the key doesn't exist, it will
+		be added and ``True`` will be returned.
+		"""
+		if key not in self:
+			self.add(key)
+		return self.should_do(key)
+
+
+	def should_try(self, key, allow_aborted=False):
+		"""
+		Similar to :py:meth:`should_do`, but increments the number of tries on
+		keys for which ``True`` will be returned.
+		"""
+		if self.should_do(key, allow_aborted):
+			self.increment_tries(key)
+			return True
+		return False
+
+
+	def should_try_add(self, key, allow_aborted=False):
+		"""
+		Similar to :py:meth:`should_try`, but if the key doesn't exist, it will
+		be added and ``True`` will be returned.
+		"""
+		if key not in self:
+			self.add(key)
+		return self.should_try(key)
 
 
 	def add(self, key):
 		"""
-		Add a key to the tracker, initialized as not done, with zero tries.
+		Add a key to the tracker, initialized as not done, not aborted, and
+		with zero tries.  Attempting to add an already-existing key will raise
+		``tastypy.DuplicateKeyError``.
 		"""
 		key = self._ensure_unicode(key)
 		if key in self:
 			raise tastypy.DuplicateKeyError(
 				'ProgressTracker: key "%s" already exists.' % key)
 		else:
-			self[key] = {'_done':False, '_tries':0}
+			self[key] = dict(DEFAULT_PROGRESS_TRACKER_MAPPING)
 
 
 	def add_if_absent(self, key):
 		"""
-		Same as add, but don't raise an error if the key exists, just do nothing.
+		Same as :py:meth:`add`, but don't raise an error if the key exists,
+		just do nothing.
 		"""
 		try:
 			self.add(key)
@@ -200,19 +312,22 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 
 	def add_many_if_absent(self, keys_iterable):
 		"""
-		Same as add_many, but silently skip keys that are already in the
-		tracker.
+		Same as :py:meth:`add_many`, but silently skip keys that are already in
+		the tracker.
 		"""
 		for key in keys_iterable:
 			self.add_if_absent(key)
 
 
-	def _read(self):
-		# Perform ``_read()`` as for POD, but first initialize counters for the
-		# number of keys that are done and number of keys that have been tried.
+	def revert(self):
+		# initialize counters for the number of items that are done / tried
 		self._num_done = 0
 		self._num_tried = 0
 		self._num_aborted = 0
+		super(ProgressTracker, self).revert()
+
+
+	def _read(self):
 		super(ProgressTracker, self)._read()
 
 
@@ -238,7 +353,7 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 
 		self[key]['_tries'] -= 1
 		self.mark_dirty(key)
-		self.maybe_sync()
+		self._maybe_sync()
 
 
 	def increment_tries(self, key):
@@ -254,7 +369,7 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 
 		self[key]['_tries'] += 1
 		self.mark_dirty(key)
-		self.maybe_sync()
+		self._maybe_sync()
 
 
 	def reset_tries(self, key):
@@ -270,7 +385,7 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 
 		self[key]['_tries'] = 0
 		self.mark_dirty(key)
-		self.maybe_sync()
+		self._maybe_sync()
 
 
 	def tries(self, key):
@@ -293,7 +408,7 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 			self._num_done += 1
 			self[key]['_done'] = True
 			self.mark_dirty(key)
-			self.maybe_sync()
+			self._maybe_sync()
 
 
 	def mark_not_done(self, key):
@@ -308,33 +423,21 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 			self._num_done -= 1
 			self[key]['_done'] = False
 			self.mark_dirty(key)
-			self.maybe_sync()
+			self._maybe_sync()
 
 
 	def num_done(self):
 		"""
-		Returns the number of entries that are done.
+		Returns the number of entries that are done.  
+		Recall that ``len(tracker)`` returns the total number of entries.
 		"""
 		return self._num_done
-
-	def num_tried(self):
-		"""
-		Returns the number of entries that have been tried at least once.
-		"""
-		return self._num_tried
 
 	def fraction_done(self):
 		"""
 		Returns the fraction (between 0 and 1) of entries that are done.
 		"""
 		return self._num_done / float(len(self))
-
-	def fraction_tried(self):
-		"""
-		Returns the fraction (between 0 and 1) of entries that have been tried
-		at least once.
-		"""
-		return self._num_tried / float(len(self))
 
 	def percent_not_done(self, decimals=2):
 		"""
@@ -352,6 +455,20 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 		"""
 		return self.percent(self.fraction_done(), decimals)
 
+	def num_tried(self):
+		"""
+		Returns the number of entries that have been tried at least once.
+		Recall that ``len(tracker)`` returns the total number of entries.
+		"""
+		return self._num_tried
+
+	def fraction_tried(self):
+		"""
+		Returns the fraction (between 0 and 1) of entries that have been tried
+		at least once.
+		"""
+		return self._num_tried / float(len(self))
+
 	def percent_not_tried(self, decimals=2):
 		"""
 		Return a string representing the percentage of entries tried at least
@@ -367,6 +484,36 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 		the percentage representation (default 2).
 		"""
 		return self.percent(self.fraction_tried(), decimals)
+
+	def num_aborted(self):
+		"""
+		Returns the number of entries that have been aborted.
+		Recall that ``len(tracker)`` returns the total number of entries.
+		"""
+		return self._num_aborted
+
+	def fraction_aborted(self):
+		"""
+		Returns the fraction (between 0 and 1) of entries that have been
+		aborted.
+		"""
+		return self._num_aborted / float(len(self))
+
+	def percent_not_aborted(self, decimals=2):
+		"""
+		Return a string representing the percentage of entries aborted, 
+		E.g.: ``'34.70 %'``.  Includes ``decimal`` number of decimals in
+		the percentage representation (default 2).
+		"""
+		return self.percent(1-self.fraction_aborted(), decimals)
+
+	def percent_aborted(self, decimals=2):
+		"""
+		Return a string representing the percentage of entries aborted, 
+		E.g.: ``'34.70 %'``.  Includes ``decimal`` number of decimals in
+		the percentage representation (default 2).
+		"""
+		return self.percent(self.fraction_aborted(), decimals)
 
 	def percent(self, fraction, decimals):
 		"""
