@@ -8,7 +8,7 @@ tastypy
 
 .. py:module:: tastypy
 
-``tastypy`` provides dict-like datastructures that transparently persist to to
+``tastypy`` provides dict-like datastructures that transparently persist to
 disk, along with multiprocessing-safe versions.  This is helpful in cases where you need a persisted key-value store but
 don't want to make a database.  For example, it could be used to keep track of
 the status of URLs in a crawler, or of tasks in a long-running process,
@@ -29,7 +29,7 @@ Included:
 .. NOTE::
 
     Please report any bugs request features by opening an issue at the
-    prject's `github page <https://github.com/enewe101/tastypy>`_. 
+    project's `github page <https://github.com/enewe101/tastypy>`_. 
 
 Install
 =======

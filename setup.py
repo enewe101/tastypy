@@ -19,7 +19,7 @@ setup(
     version='0.0.0',
 
     description=(
-		'simple python datastructures that are transparently persisted to disk'),
+		'simple python datastructures that transparently persist to disk'),
     long_description=long_description,
 
     # The project's main homepage.
