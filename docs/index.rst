@@ -8,6 +8,9 @@ tastypy
 
 .. py:module:: tastypy
 
+This documentation is best viewed on 
+`readthedocs <http://python-tastypy.readthedocs.io/en/latest/>`_.
+
 ``tastypy`` provides dict-like datastructures that transparently persist to
 disk, along with multiprocessing-safe versions.  This is helpful in cases where you need a persisted key-value store but
 don't want to make a database.  For example, it could be used to keep track of
