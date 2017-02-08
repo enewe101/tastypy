@@ -17,7 +17,9 @@ from .json_serializer import JSONSerializer
 # import of progress_tracker must come after persistent_ordered_dict, because
 # progress_tracker module initialization requires persisitent_ordered_dict
 # to already be loaded in tastypy
-from .progress_tracker import ProgressTracker, Tracker
+from .progress_tracker import (
+	ProgressTracker, Tracker, DEFAULT_PROGRESS_TRACKER_MAPPING 
+)
 
 # Initialization of shared_progress_tracker requires that progress_tracker has
 # already been imported into tastypy

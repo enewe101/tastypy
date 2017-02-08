@@ -25,7 +25,7 @@ import multiprocessing
 # TODO: test that int and tuple-typed keys work
 
 TEST_PATH = 'test-data'
-DEFAULT_TRACKER_ITEM = {'_tries':0, '_done':False}
+DEFAULT_TRACKER_ITEM = dict(tastypy.DEFAULT_PROGRESS_TRACKER_MAPPING)
 
 def remove_if_exists(path):
 	if os.path.exists(path):
@@ -267,11 +267,11 @@ class TestTracker(TestCase):
 		my_tracker.add('a')
 		for i in range(tastypy.DEFAULT_SYNC_AT):
 			my_tracker.add(str(i))
-		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':False})
+		self.assertEqual(my_tracker['a'], DEFAULT_TRACKER_ITEM)
 
 		# Verify persistence
 		entries = read_test_files()
-		self.assertEqual(entries['a'], {'_tries':0, '_done':False})
+		self.assertEqual(entries['a'], DEFAULT_TRACKER_ITEM)
 
 		# Verify that DuplicateKeyError is raised if we try adding the same
 		# key twice
@@ -282,31 +282,34 @@ class TestTracker(TestCase):
 		my_tracker.add_if_absent('a')
 
 		# Test the check function (should return false)
-		self.assertFalse(my_tracker.check('a'))
+		self.assertFalse(my_tracker.done('a'))
 
 		# Mark done, now check should return True
 		my_tracker.mark_done('a')
-		self.assertTrue(my_tracker.check('a'))
+		self.assertTrue(my_tracker.done('a'))
 
 		# Mark not done, now check returns False again
 		my_tracker.mark_not_done('a')
-		self.assertFalse(my_tracker.check('a'))
+		self.assertFalse(my_tracker.done('a'))
 
 		# Test check or add.  On a key that exists but is not done, it should
-		# return False but have no effect on the entry
-		self.assertFalse(my_tracker.check_or_add('a'))
-		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':False})
+		# return False and have no effect on the entry
+		self.assertTrue(my_tracker.should_do_add('a'))
+		self.assertEqual(my_tracker['a'], DEFAULT_TRACKER_ITEM)
 
-		# Test check or add.  On a key that exists but is not done, it should
-		# return False but have no effect on the entry
+		# Test check or add.  On a key that exists and is done, it should
+		# return True and have no effect on the entry
 		my_tracker.mark_done('a')
-		self.assertTrue(my_tracker.check_or_add('a'))
-		self.assertEqual(my_tracker['a'], {'_tries':0, '_done':True})
+		self.assertFalse(my_tracker.should_do_add('a'))
+		self.assertEqual(
+			my_tracker['a'], 
+			{'_tries':0, '_aborted':False, '_done':True}
+		)
 
-		# Test check or add.  On a key that doesn't exist, it will return False
+		# Test check or add.  On a key that doesn't exist, it will return True
 		# and add the key
-		self.assertFalse(my_tracker.check_or_add('b'))
-		self.assertEqual(my_tracker['b'], {'_tries':0, '_done':False})
+		self.assertTrue(my_tracker.should_do_add('b'))
+		self.assertEqual(my_tracker['b'], DEFAULT_TRACKER_ITEM)
 
 		# Test incrementing tries
 		self.assertEqual(my_tracker.tries('a'), 0)
@@ -321,13 +324,19 @@ class TestTracker(TestCase):
 
 		# Test setting a sub-key
 		my_tracker['a']['b'] = 'c'
-		self.assertEqual(my_tracker['a'], {'b':'c', '_tries':0, '_done':True})
+		self.assertEqual(
+			my_tracker['a'], 
+			{'b':'c', '_tries':0, '_done':True, '_aborted':False}
+		)
 
 		# Test that a sub-key will be synchronized
 		for i in range(tastypy.DEFAULT_SYNC_AT):
 			my_tracker.reset_tries(str(i))
 		entries = read_test_files()
-		self.assertEqual(entries['a'], {'b':'c', '_tries':0, '_done':True})
+		self.assertEqual(
+			entries['a'],
+			{'b':'c', '_tries':0, '_done':True, '_aborted':False}
+		)
 
 
 	def test_update(self):
@@ -667,7 +676,7 @@ class TestSharedTracker(TestCase):
 		my_tracker.unhold()
 
 		expected_keys = [str(i) for i in range(20)]
-		expected_values = [{'_tries':0, '_done':False} for i in expected_keys]
+		expected_values = [DEFAULT_TRACKER_ITEM for i in expected_keys]
 		expected_items = zip(expected_keys, expected_values)
 		self.assertEqual(my_tracker.values(), expected_values)
 		self.assertEqual(my_tracker.keys(), expected_keys)
@@ -706,7 +715,7 @@ class TestSharedTracker(TestCase):
 		tracker.mark_done('d')
 
 		items = []
-		for item in tracker.todo_items:
+		for item in tracker.todo_items():
 			items.append(item)
 		self.assertEqual(items, [
 			('b', {'_tries':1, '_done':False, '_aborted':False})

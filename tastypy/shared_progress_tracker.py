@@ -126,17 +126,33 @@ class SharedPersistentOrderedDict(object):
 	}
 	SERVER_DATASTRUCTURE = tastypy.PersistentOrderedDict
 
-	def __init__(self, *args, **kwargs):
+	def __init__(
+			self, 
+			path,
+			init={},
+			gzipped=False,
+			file_size=tastypy.DEFAULT_FILE_SIZE,
+			sync_at=tastypy.DEFAULT_SYNC_AT,
+			clone=True
+		):
+
+		# Underlying datastructures supporting a shared proxy can't be clones.
+		clone=False
 
 		self.client_pipe, server_pipe = multiprocessing.Pipe()
 
-		# create / start the underlying POD server
+		# Define a function that builds the underlying datastructure
+		def build_datastructure():
+			return self.SERVER_DATASTRUCTURE(
+				path=path, init=init, gzipped=gzipped, 
+				file_size=file_size, sync_at=sync_at, clone=clone
+			)
+
+		# Create / start the server, passing it the datastructure-building 
+		# function
 		server_tracker = multiprocessing.Process(
 			target=serve_datastructure,
-			args=(
-				lambda: self.SERVER_DATASTRUCTURE(*args, clone=False, **kwargs),
-				server_pipe
-			)
+			args=(build_datastructure, server_pipe)
 		)
 		server_tracker.daemon = True	# Shut down server if main process exits
 		server_tracker.start()
@@ -376,7 +392,7 @@ class SharedProgressTracker(SharedPersistentOrderedDict):
 		'add', 	'check_or_add', 'add_if_absent', 'add_many', 
 			'add_many_if_absent',
 
-		'abort', 'unabort', 'aborted'
+		'abort', 'unabort', 'aborted',
 
 		'num_tried', 'fraction_tried','percent_tried', 'percent_not_tried',
 		'num_done', 'fraction_done', 'percent_done', 'percent_not_done', 
@@ -385,6 +401,29 @@ class SharedProgressTracker(SharedPersistentOrderedDict):
 		'percent', 
 	}
 	SERVER_DATASTRUCTURE = tastypy.ProgressTracker
+
+	def __init__(
+		self, 
+		path,
+		max_tries=0,
+		init={},
+		gzipped=False,
+		file_size=tastypy.DEFAULT_FILE_SIZE,
+		sync_at=tastypy.DEFAULT_SYNC_AT,
+		clone=False
+	):
+
+		# Underlying datastructures supporting a shared proxy can't be clones.
+		clone=False
+
+		# Delegate to SharedPOD to start up the server.  The datastructure sent
+		# to the server is overridden by SERVER_DATASTRUCTURE above.
+		super(SharedProgressTracker, self).__init__(
+			path, init, gzipped, file_size, sync_at, clone
+		)
+
+		# Remember max_tries locally
+		self.max_tries = max_tries
 
 
 	# TODO: it would be good to find a way to properly delegate the filtering

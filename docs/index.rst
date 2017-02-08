@@ -26,6 +26,11 @@ Included:
  - |SharedProgressTracker|_ (|SharedTracker|_ for short): a
    multiprocessing-safe version of |Tracker|_
 
+.. NOTE::
+
+    Please report any bugs request features by opening an issue at the
+    prject's `github page <https://github.com/enewe101/tastypy>`_. 
+
 Install
 =======
 .. code-block:: bash
