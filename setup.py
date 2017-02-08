@@ -16,7 +16,7 @@ with open(path.join(here, 'README.rst'), encoding='utf-8') as f:
 
 setup(
     name='tastypy',
-    version='0.0.0',
+    version='0.0.1',
 
     description=(
 		'simple python datastructures that transparently persist to disk'),
@@ -61,5 +61,5 @@ setup(
 	package_data={
 		'tastypy': ['README.rst']
 	},
-	install_requires=[]
+	install_requires=['natsort', 'tblib']
 )
