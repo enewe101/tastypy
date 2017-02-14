@@ -11,27 +11,31 @@ tastypy
 This documentation is best viewed on 
 `readthedocs <http://python-tastypy.readthedocs.io/en/latest/>`_.
 
-``tastypy`` provides dict-like datastructures that transparently persist to
-disk, along with multiprocessing-safe versions.  This is helpful in cases where you need a persisted key-value store but
-don't want to make a database.  For example, it could be used to keep track of
-the status of URLs in a crawler, or of tasks in a long-running process,
-enabling the process to pick up where it left off after a crash or
-interruption.
+``tastypy`` provides a dict-like datastructure that transparently persists to
+disk, making the data available after a program crashes or exits.  The
+datastructure's iterators yield keys and values in the order in which keys were
+first added.
+
+This is helpful whenever you want a persistent key-value store, but don't want
+to create a database.  For example, you can store partial results from a
+long-running program, and allow the program to pick up where it left off after
+a crash or interruption.
 
 Included:
 
- - |PersistentOrderedDict|_ (|POD|_ for short): a transparently persistent
-   dict-like mapping
- - |SharedPersistentOrderedDict|_ (|SharedPOD|_ for short): a
-   multiprocessing-safe version of |POD|_
- - |ProgressTracker|_ (|Tracker|_ for short): a subclass of |POD|_ that helps
-   keep track of long-running processes with repetitive tasks
- - |SharedProgressTracker|_ (|SharedTracker|_ for short): a
-   multiprocessing-safe version of |Tracker|_
+ - |POD|_ (alias for |PersistentOrderedDict|_): a persistent dict-like mapping.
+ - |Tracker|_: a subclass of |POD|_ specifically for tracking the state of
+   repetitive tasks in a long running program (for example, use it as a queue
+   for URLs in a crawler).
+
+Multiprocessing-safe versions are also included:
+
+ -  |SharedPOD|_ (alias for |SharedPersistentOrderedDict|_)
+ - |SharedTracker|_
 
 .. NOTE::
 
-    Please report any bugs request features by opening an issue at the
+    Please report any bugs and request features by opening an issue at the
     project's `github page <https://github.com/enewe101/tastypy>`_. 
 
 Install
@@ -58,14 +62,15 @@ location:
     >>> my_pod['foo'] = 'bar'
     >>> exit()
 
-Data stored in ``POD``\s is preserved after the program exits:
+Previously-stored data can then be accessed after the original program
+terminates:
 
 .. code-block:: python
 
     >>> from tastypy import POD
     >>> my_pod = POD('path/to/my.pod')
     >>> my_pod['foo']
-    bar
+    'bar'
 
 ``POD``\ s are meant to feel like ``dict``\ s in most respects.  They support
 the same iteration mechanisms, a similar implementation of ``update()``, and
@@ -118,26 +123,14 @@ be properly synchronized.  However, if you make a reference to a mutable type st
 in the ``POD``, and then mutate it using *that* reference, there is no way for
 the ``POD`` to know about it, and that change will not be persisted.
 
-In other words, don't do this:
+So, for example:
 
 .. code-block:: python
 
     >>> my_pod['key'] = []
     >>> my_list = my_pod['key']
     >>> my_list.append(42)              # BAD! This won't be sync'd!
-
-Instead, do this:
-
-.. code-block:: python
-
-    >>> my_pod['key'] = []
     >>> my_pod['key'].append(42)        # GOOD! This will be sync'd!
-
-.. NOTE::
-
-    If you mutate an object that was accessed by keying into the ``POD``, then
-    the ``POD`` knows about the change.  If you mutate an object using another
-    reference, the ``POD`` will not persist that change.
 
 ``POD``\ s keep track of values that were changed in memory, and synchronize to
 disk whenever enough values have changed (by default, 1000), or when the
@@ -241,19 +234,14 @@ So, instead of doing this:
 
     shared_pod = tastypy.SharedPOD('my.pod')
 
-    shared_pod['foo'] = {'bar':0, 'baz':[]}
-    shared_pod['foo']['bar'] += 1
-    shared_pod['foo']['baz'].append('fizz')
+    shared_pod['foo'] = {'bar':0, 'baz':[]}         # BAD! Won't sync.
+    shared_pod.set['foo'] = {'bar':4, 'baz':[]}     # Good!
 
-You should do this:
+    shared_pod['foo']['bar'] += 1                   # BAD! Won't sync.
+    shared_pod.set['foo']['bar'] += 1               # Good!
 
-.. code-block:: python
-
-    shared_pod = tastypy.SharedPOD('my.pod')
-
-    shared_pod.set['foo'] = {'bar':4, 'baz':[]}
-    shared_pod.set['foo']['bar'] += 1
-    shared_pod.set['foo']['baz'].append('fizz')
+    shared_pod['foo']['baz'].append('fizz')         # BAD! Won't sync.
+    shared_pod.set['foo']['baz'].append('fizz')     # Good!
 
 The ``SharedPOD``\ |s| ``.set`` attribute uses some tricks to capture
 arbitrarily deep "keying" and "indexing", method calls,  arguments, and tell
@@ -413,19 +401,15 @@ SharedPersistentOrderedDict reference
         .. py:attribute:: set
 
             Attribute that accepts all mutable operations on the ``SharedPOD``.  
-            E.g. instead of this:
+            E.g.:
 
             .. code-block:: python
 
-                shared_pod['some']['key'] += 42
-                shared_pod['some']['list'].append('forty-two')
+                shared_pod['some']['key'] += 42                     # BAD!, won't sync
+                shared_pod.set['some']['key'] += 42                 # Good!
 
-            Do this:
-
-            .. code-block:: python
-
-                shared_pod.set['some']['key'] += 42
-                shared_pod.set['some']['list'].append('forty-two')
+                shared_pod['some']['list'].append('forty-two')      # BAD!, won't sync
+                shared_pod.set['some']['list'].append('forty-two')  # Good!
 
         .. automethod:: close()
         .. automethod:: locked()
