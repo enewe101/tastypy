@@ -228,7 +228,7 @@ Writing to shared ``SharedPOD``\ s
 ----------------------------------
 The ``SharedPOD`` has to use a different strategy to ensure that data is
 correctly synchronized.  It isn't enough to mark values as dirty: the new values
-needs to be forwarded to the underlying server.
+need to be forwarded to the underlying server.
 
 This means that you need to explicitly signal when an operation can mutate the
 ``SharedPOD``.  Any time you do something to a ``SharedPOD`` that can mutate
@@ -500,11 +500,11 @@ see how the ``Tracker`` can support that usecase.  First using a |POD|_:
             url_pod[url]['tries'] += 1
 
             # Attempt to crawl the url, move on if we don't succeed
-            success, found_links = crawl(url)
+            success, found_urls = crawl(url)
             if not success:
                 continue
 
-            # Add the new links we found, and mark this url done
+            # Add the new urls we found, and mark this url done
             for found_url in found_urls:
                 if url not in url_pod:
                     url_pod[url] = {'tries':0, 'done':False}
@@ -518,7 +518,7 @@ have already been tried at least 3 times.
 
 The ``Tracker`` provides some facilities to support this usecase.  All entries
 in a ``Tracker`` are dictionaries that minimally have a ``_done`` flag that
-defaults to ``False``, a ``_aborted`` flag that also defaults to ``False``, and
+defaults to ``False``, an ``_aborted`` flag that also defaults to ``False``, and
 a ``_tries`` counter that defaults to ``0``.  ``Tracker``\ s have various
 methods to help keep track of tasks, and let you iterate over only tasks that
 aren't done, aborted, or tried too many times.  Using a ``Tracker``, the program
