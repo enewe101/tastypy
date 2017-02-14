@@ -534,11 +534,11 @@ would look like this:
         for url in url_tracker.try_keys():
 
             # Attempt to crawl the url, move on if we don't succeed
-            success, found_links = crawl(url)
+            success, found_urls = crawl(url)
             if not success:
                 continue
 
-            # Add the new links we found, and mark this url done
+            # Add the new urls we found, and mark this url done
             url_tracker.add_many_if_absent(found_urls)
             url_tracker.mark_done(url)
 
