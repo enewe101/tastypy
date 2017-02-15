@@ -78,11 +78,11 @@ their ``len`` corresponds to their number of entries.
 
 JSON -- general, simple, secure
 -------------------------------
-Data is serialized in JSON format using the builtin ``json`` module for
-serialization and deserialization.  JSON is general enough to represent pretty
-much any data, and unlike pickles, it is secure, application-independant, and
-interoperable across programs and python versions.  The persistence files are
-human-readable, and easily hacked manually or with other tools.
+Data is serialized in JSON format using the builtin ``json`` module.  JSON is
+general enough to represent pretty much any data, and unlike pickles, it is
+secure, application-independant, and interoperable across programs and python
+versions.  The persistence files are human-readable, and easily hacked manually
+or with other tools.
 
 While there are advantages to using ``json``, there are also some limitations.
 Only json-serializable data can be stored in a ``POD``: which includes

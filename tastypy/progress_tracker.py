@@ -471,7 +471,8 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 
 	def percent_not_tried(self, decimals=2):
 		"""
-		Return a string representing the percentage of entries tried at least
+		Return a string representing the percentage of entries that *have not*
+		been tried tried at least
 		once, E.g.: ``'34.70 %'``.  Includes ``decimal`` number of decimals in
 		the percentage representation (default 2).
 		"""
@@ -501,7 +502,7 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
 
 	def percent_not_aborted(self, decimals=2):
 		"""
-		Return a string representing the percentage of entries aborted, 
+		Return a string representing the percentage of entries *not* aborted, 
 		E.g.: ``'34.70 %'``.  Includes ``decimal`` number of decimals in
 		the percentage representation (default 2).
 		"""
