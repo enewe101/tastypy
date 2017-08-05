@@ -429,10 +429,47 @@ class SharedProgressTracker(SharedPersistentOrderedDict):
 	# TODO: it would be good to find a way to properly delegate the filtering
 	# of done keys to the server, since that transmits less data between
 	# processes and means less code duplication.
+	def aborted_items(self):
+		"""
+        Provide an iterator of key-value tuples for keys not yet marked done
+        and with fewer than max_tries.
+		"""
+		for key, val in self._iter(True):
+            if val['_aborted']:
+                yield key, val
+
+
+	# TODO: it would be good to find a way to properly delegate the filtering
+	# of done keys to the server, since that transmits less data between
+	# processes and means less code duplication.
+	def aborted_keys(self):
+		"""
+        Provide an iterator of key-value tuples for keys not yet marked done
+        and with fewer than max_tries.
+		"""
+		for key, val in self.aborted_items():
+            yield key
+
+
+	# TODO: it would be good to find a way to properly delegate the filtering
+	# of done keys to the server, since that transmits less data between
+	# processes and means less code duplication.
+	def aborted_values(self):
+		"""
+        Provide an iterator of key-value tuples for keys not yet marked done
+        and with fewer than max_tries.
+		"""
+		for key, val in self.aborted_items():
+            yield val
+
+
+	# TODO: it would be good to find a way to properly delegate the filtering
+	# of done keys to the server, since that transmits less data between
+	# processes and means less code duplication.
 	def todo_items(self, allow_aborted=False):
 		"""
-		Provide an iterator of key-value tuples for keys not yet marked done and 
-		with fewer than max_tries.
+        Provide an iterator of key-value tuples for keys not yet marked done
+        and with fewer than max_tries.
 		"""
 		for key, val in self._iter(True):
 			worth_trying = (

@@ -144,6 +144,35 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
         return self._values[key]['_aborted']
 
 
+    def aborted_keys(self):
+        """
+        Provides an iterator over keys that are marked aborted.  Iteration
+        order matches the order in which keys were added.
+        """
+        for key in self._keys:
+            aborted = self._values[key]['_aborted']
+            if aborted:
+                yield key
+
+
+    def aborted_items(self):
+        """
+        Provides an iterator of key-value tuples for keys that are marked
+        aborted.  Iteration order matches the order in which keys were added.
+        """
+        for key in self.todo_keys(allow_aborted):
+            yield key, self._values[key]
+
+
+    def aborted_values(self):
+        """
+        Provides an iterator over values corresponding to keys that are marked
+        aborted.  Iteration order matches the order in which keys were added.
+        """
+        for key in self.aborted_keys():
+            yield self._values[key]
+
+
     def todo_keys(self, allow_aborted=False):
         """
         Provides an iterator over keys that are not done, not
@@ -153,7 +182,7 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
         Iteration order matches the order in which keys were added.
         """
         for key in self._keys:
-            val = self._values[key]
+            #val = self._values[key]
             if self.should_do(key, allow_aborted):
                 yield key
 
@@ -172,9 +201,9 @@ class ProgressTracker(tastypy.PersistentOrderedDict):
         """
         Provides an iterator over values corresponding to keys that are not
         done, not aborted, and have been tried fewer than ``max_tries`` times.
-        If ``allow_aborted`` is ``True``, then yield aborted values that meet the
-        other criteria.
-        Iteration order matches the order in which keys were added.
+        If ``allow_aborted`` is ``True``, then yield aborted values that meet
+        the other criteria.  Iteration order matches the order in which keys
+        were added.
         """
         for key in self.todo_keys(allow_aborted):
             yield key, self._values[key]
