@@ -6,14 +6,15 @@ This allows you to easily persist data between non-concurrent runs of a
 program.  It's useful for keeping track of progress in long jobs.
 """
 
+
 # TODO keys should be converted to a special internal type that knows if it's
 # unicode escaped.  Or, in otherwords, we should be checking if keys are
 # unicode in getitem and setitem.
 
+
 import tastypy
 import atexit
 import os
-import copy
 import gzip
 import signal
 import sys
@@ -22,37 +23,12 @@ import sys
 DEFAULT_FILE_SIZE = 1000
 DEFAULT_SYNC_AT = 1000
 
-#def _deep_setitem(container, key_tuple, value):
-#    owner = _deep_getitem(container, key_tuple[:-1])
-#    owner[key_tuple[-1]] = value
-
 
 def _deep_getitem(container, key_tuple):
     value = container
     for key in key_tuple:
         value = value[key]
     return value
-
-
-#class Mutator(object):
-#    def __init__(self, client):
-#        self.client = client
-#
-#    def __getitem__(self, key):
-#        val = self.client[key]
-#        self.client.update(key)
-#        return val
-#
-#
-#class SingletonDecorator:
-#    def __init__(self,klass):
-#        self.klass = klass
-#        self.instance = None
-#    def __call__(self,*args,**kwds):
-#        if self.instance == None:
-#            self.instance = self.klass(*args,**kwds)
-#        return self.instance
-
 
 
 class PersistentOrderedDict(object):
@@ -84,24 +60,42 @@ class PersistentOrderedDict(object):
     def __init__(
         self, 
         path,
+        mode=None,
         init={},
         gzipped=False,
         file_size=DEFAULT_FILE_SIZE,
         sync_at=DEFAULT_SYNC_AT,
-        clone=True
+        clone=True,
     ):
+        # Soon mode will default to 'r' (read only).  The current behavior is
+        # to default to writeable.  Warn users about the coming change.
+        if mode is None:
+            mode = 'w'
+            print (
+                "PODs and Trackers now take a mode flag, like files, e.g. 'r' "
+                "or 'w' for read only or writeable respectively.  In future "
+                "versions, the mode will default to readonly, so you will need "
+                "to explicitly do my_pod = POD(path, 'w') to achieve the usual "
+                "writeable behavior."
+            )
+
+        # Validate mode's value
+        if mode not in 'rw':
+            raise ValueError("Mode must be 'r' or 'w'.")
+
+
         # In addition to initializing some of the attributes fo the POD, we'll
         # also identify many of them with class attributes, which produces
         # singleton-like behavior, and protects against stale overwrites if
         # multiple PODs are created that point at the same location on disk
         path = tastypy.normalize_path(path)
         self._ensure_path(path)
-        self._init_sharable_attrs(path, gzipped, file_size, clone)
+        self._init_sharable_attrs(mode, path, gzipped, file_size, clone)
 
         # Bind the file opening algorithm to self's namespace
         self._open = gzip.open if gzipped else open
 
-        # Different clones can have different sync_at and _hold values.
+        # Different clones can have different sync_at, _hold, and values.
         self.sync_at = sync_at
         self._hold = False
 
@@ -140,8 +134,9 @@ class PersistentOrderedDict(object):
         return self._SHARED_POD_STATE
 
 
-    def _shared_attrs(self, path, gzipped, file_size):
+    def _shared_attrs(self, mode, path, gzipped, file_size):
         return {
+            '_mode': mode,
             '_path': path,
             '_values': {},
             '_keys': [],
@@ -153,10 +148,10 @@ class PersistentOrderedDict(object):
         }
 
 
-    def _init_sharable_attrs(self, path, gzipped, file_size, clonable):
+    def _init_sharable_attrs(self, mode, path, gzipped, file_size, clonable):
         # Instances that point to the same location are made to be "clones" of
-        # eachother, by pointing certain "sharable attributes" at the same memory
-        # location (using class variables).  This prevents them from
+        # eachother, by pointing certain "sharable attributes" at the same
+        # memory location (using class variables).  This prevents them from
         # stale-overwriting one anothers data, because they share the same
         # data.  Howver if clonable is False, then we don't put the sharable
         # attributes on class variables, keeping them isolated.
@@ -170,6 +165,13 @@ class PersistentOrderedDict(object):
 
             for key in self._get_shared_state()[path]:
                 setattr(self, key, self._get_shared_state()[path][key])
+
+            # Validate against the existing parameters that must be shared
+            if mode != self._mode:
+                raise ValueError(
+                    'A POD instance pointed at the same location '
+                    'exists and has a conflicting opening mode.'
+                )
 
             # Validate against the existing parameters that must be shared
             if gzipped != self._gzipped:
@@ -192,7 +194,7 @@ class PersistentOrderedDict(object):
 
                 # Create the shared space for PODs to this disk location
                 self._get_shared_state()[path] = self._shared_attrs(
-                    path,gzipped,file_size)
+                    mode,path,gzipped,file_size)
 
                 # Identify with the shared space
                 for key in self._get_shared_state()[path]:
@@ -200,7 +202,9 @@ class PersistentOrderedDict(object):
 
         # If not clonable, initialize sharable attrs, but keep them isolate.
         else:
-            for key, val in self._shared_attrs(path,gzipped,file_size).items():
+            for key, val in self._shared_attrs(
+                mode,path,gzipped,file_size
+            ).items():
                 setattr(self, key, val)
 
         # If we didn't clone an existing clone (maybe because there wasn't one)
@@ -211,8 +215,9 @@ class PersistentOrderedDict(object):
             self.revert()
 
             # Register to synchronize before the script exits
-            atexit.register(self.sync)
-            signal.signal(signal.SIGTERM, self._sync_on_terminate)
+            if self.is_writeable(mode):
+                atexit.register(self.sync)
+                signal.signal(signal.SIGTERM, self._sync_on_terminate)
 
 
     def update(self, *mappings, **kwargs):
@@ -321,6 +326,9 @@ class PersistentOrderedDict(object):
         """
         Force synchronization of all dirty values.
         """
+        if not self.is_writeable():
+            raise ValueError("Attempting to write to disk when mode is 'r'.")
+
         dirty_files = set()
         for key in self._dirty:
             index = self._index_lookup[key]
@@ -372,7 +380,8 @@ class PersistentOrderedDict(object):
 
     def revert(self):
         """
-        Load values from disk into memory, discarding any unsynchronized changes.
+        Load values from disk into memory, discarding any unsynchronized
+        changes.
         """
         # Clear core data
         self._keys[:] = []
@@ -455,18 +464,30 @@ class PersistentOrderedDict(object):
                     % (self._path_from_int(i), str(error))
                 )
 
+
     def _read_intercept(self, key, val):
         return key, val
 
 
+    def is_writeable(self, mode=None):
+        """
+        Indicates whether self's mode, or the mode passed in, corresponds to 
+        being writeable.
+        """
+        if mode is None:
+            mode = self._mode
+        return mode == 'w'
+
+
     def _maybe_sync(self, preemptive=0):
         """Synchronize if not currently on ``hold()``."""
+        if not self.is_writeable():
+            return
         if self._hold:
             return
         if len(self._dirty) < self.sync_at - preemptive:
             return
         self.sync()
-
 
 
     def __contains__(self, key):
